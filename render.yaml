@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: mf-movie-bot
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_SESSION_STRING
+        sync: false
+      - key: TELEGRAM_SOURCE_CHATS
+        sync: false
+      - key: FORCE_JOIN_CHANNEL_ID
+        sync: false
+      - key: FORCE_JOIN_CHANNEL_URL
+        sync: false
+      - key: BOT_ALLOWED_USER_IDS
+        sync: false
+      - key: BOT_WEBHOOK_SECRET
+        sync: false
