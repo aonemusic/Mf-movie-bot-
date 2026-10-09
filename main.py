@@ -64,11 +64,17 @@ elif BOT_TOKEN:
 else:
     WEBHOOK_SECRET = ""
 
-TELEGRAM_SOURCE_CHATS = [
-    item.strip()
-    for item in os.getenv("TELEGRAM_SOURCE_CHATS", "").split(",")
-    if item.strip()
-]
+FILE_BACKUP_CHANNEL_ID = os.getenv("FILE_BACKUP_CHANNEL_ID", "").strip()
+def configured_source_chat_refs(primary: str, backup: str = "") -> list[str]:
+    refs = [item.strip() for item in primary.split(",") if item.strip()]
+    if backup and backup not in refs:
+        refs.append(backup)
+    return refs
+
+
+TELEGRAM_SOURCE_CHATS = configured_source_chat_refs(
+    os.getenv("TELEGRAM_SOURCE_CHATS", ""), FILE_BACKUP_CHANNEL_ID
+)
 FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip()
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()

@@ -53,6 +53,16 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertEqual(main.message_link(public, 55), "https://t.me/archive/55")
         self.assertEqual(main.message_link(private, 55), "https://t.me/c/1234567890/55")
 
+    def test_backup_source_is_added_without_replacing_existing_sources(self):
+        self.assertEqual(
+            main.configured_source_chat_refs("@archive_one, -100123", "-1004443404016"),
+            ["@archive_one", "-100123", "-1004443404016"],
+        )
+        self.assertEqual(
+            main.configured_source_chat_refs("-1004443404016", "-1004443404016"),
+            ["-1004443404016"],
+        )
+
     def test_search_catalog_matches_all_terms_as_substrings(self):
         async def run():
             records = {

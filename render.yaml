@@ -14,6 +14,8 @@ services:
         sync: false
       - key: TELEGRAM_SOURCE_CHATS
         sync: false
+      - key: FILE_BACKUP_CHANNEL_ID
+        sync: false
       - key: APPROVED_DESTINATION_CHANNEL_IDS
         sync: false
       - key: DESTINATION_CHANNEL_ID

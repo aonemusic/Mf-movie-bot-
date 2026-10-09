@@ -5,6 +5,7 @@ A Telegram bot for an archive the owner is authorized to distribute. It indexes 
 ## How it works
 
 - A bot administrator posts a new media item in a channel listed in `TELEGRAM_SOURCE_CHATS`. The bot stores its filename/title, media type, byte size, source chat/message IDs, source link where available, and indexed time in Firebase. Media bytes are not downloaded to Render or Firebase.
+- `FILE_BACKUP_CHANNEL_ID` is an optional additional archive source. It is added alongside (not instead of) the channels in `TELEGRAM_SOURCE_CHATS`.
 - A user opens the bot and sends a movie title or filename as ordinary text. The bot checks membership in `FORCE_JOIN_CHANNEL_ID`, searches indexed filenames/captions, and shows matching file-name/size buttons.
 - When a user selects a result, the bot copies the original Telegram post into that user's private chat. The bot tells the user that its copy will be deleted after 10 minutes and schedules the deletion. Pending deletion metadata is stored in Firebase so a Render restart can resume scheduled cleanup.
 - The configured admin may promote the bot to administrator in a destination channel. The bot privately asks for a separate Yes/No approval. Yes enables forwarding of future media posts only; No cancels. `/shareall` reissues prompts and never skips approval.
@@ -20,6 +21,7 @@ Add values in the Render service's **Environment**. Never commit secrets or past
 | `BOT_TOKEN` | Yes | Telegram bot token. Secret. |
 | `ADMIN_ID` | Yes | Numeric Telegram user ID permitted to approve destinations and use `/status`. |
 | `TELEGRAM_SOURCE_CHATS` | Yes | Comma-separated Telegram channel IDs or usernames whose new posts should be indexed and forwarded. |
+| `FILE_BACKUP_CHANNEL_ID` | No | One extra file-backup/archive channel ID, added to `TELEGRAM_SOURCE_CHATS` without replacing its list. |
 | `FIREBASE_DATABASE_URL` | Yes | Realtime Database URL, for example the URL from the Firebase web configuration. |
 | `FIREBASE_PROJECT_ID` | Recommended | Firebase project ID. |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | Yes | Full service-account JSON private key. Store as a secret environment variable in Render only. |
@@ -38,7 +40,7 @@ Create the Realtime Database in the Firebase project before deploying. In Fireba
 
 1. Set the variables above in Render Environment. Do not configure or share `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, or `TELEGRAM_SESSION_STRING`; this version uses the Telegram Bot API only.
 2. Open the bot and send `/start` as the configured admin so it can privately send approval prompts.
-3. Add the bot as an administrator in each source channel so Telegram sends it `channel_post` updates. Ensure `TELEGRAM_SOURCE_CHATS` identifies those channels.
+3. Add the bot as an administrator in each source channel so Telegram sends it `channel_post` updates. Ensure `TELEGRAM_SOURCE_CHATS` and, if used, `FILE_BACKUP_CHANNEL_ID` identify those channels.
 4. Add the bot as an administrator in the force-join channel. Telegram requires bot admin access for reliable membership checks. If that channel is private, set a valid `FORCE_JOIN_CHANNEL_URL` invite link.
 5. Promote the bot to administrator in each destination channel. The configured admin receives a Yes/No prompt for that channel. Approvals made with a button are in memory; add the channel's numeric ID to `APPROVED_DESTINATION_CHANNEL_IDS` to retain it after restart.
 6. Add new authorized media posts to the configured source channel. The bot indexes each new post and forwards it to approved destinations when `AUTO_FORWARD_NEW=true`.
