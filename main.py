@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, Header, HTTPException
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
+from telegram.error import RetryAfter
+from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, ContextTypes
 from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
 
@@ -32,12 +33,25 @@ TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "")
 TELEGRAM_SOURCE_CHATS = [x.strip() for x in os.getenv("TELEGRAM_SOURCE_CHATS", "").split(",") if x.strip()]
 FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "")
 FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "")
+_ADMIN_ID_VALUE = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID = int(_ADMIN_ID_VALUE) if _ADMIN_ID_VALUE.isdigit() else 0
+DESTINATION_CHANNEL_ID = os.getenv("DESTINATION_CHANNEL_ID", "").strip()
+AUTO_FORWARD_NEW = os.getenv("AUTO_FORWARD_NEW", "true").strip().lower() in {"1", "true", "yes", "on"}
+MAIN_CHANNEL_URL = "https://t.me/mfmainchannel"
 
 # Telegram channel history is the source of truth. This process-local index is
 # rebuilt by scanning only explicitly configured archive channels after restart.
 MEMORY_INDEX: dict[tuple[int, int], dict] = {}
 SOURCE_STATE: dict[int, dict] = {}
 SOURCE_CHAT_IDS: set[int] = set()
+FORWARDED_SOURCE_MESSAGES: set[tuple[int, int]] = set()
+DESTINATION_HISTORY_VERIFIED = False
+ARCHIVE_SCAN_COMPLETE = False
+FORWARD_LOCK = asyncio.Lock()
+FORWARD_INTERVAL_SECONDS = 3.0
+LAST_FORWARD_AT = 0.0
+BULK_FORWARD_TASK: asyncio.Task | None = None
+SHARE_PROMPT_SENT = False
 INDEX_LOCK = threading.RLock()
 BOT_APP: Application | None = None
 MT_CLIENT: TelegramClient | None = None
@@ -58,6 +72,8 @@ def is_allowed(user_id: int | None) -> bool:
 
 
 async def require_access(message, user_id: int | None, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if ADMIN_ID and user_id == ADMIN_ID:
+        return True
     if not is_allowed(user_id):
         await message.reply_text(
             "<b>Access restricted</b>\nThis account is not on the bot's optional allow-list.",
@@ -318,10 +334,20 @@ async def share_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     try:
         _, chat_id, message_id = (query.data or "").split(":", 2)
+        source_key = (int(chat_id), int(message_id))
+        with INDEX_LOCK:
+            row = MEMORY_INDEX.get(source_key, {}).copy()
         await context.bot.copy_message(
             chat_id=query.message.chat_id,
-            from_chat_id=int(chat_id),
-            message_id=int(message_id),
+            from_chat_id=source_key[0],
+            message_id=source_key[1],
+            caption=media_caption(
+                row.get("file_name"),
+                row.get("file_type"),
+                row.get("caption", ""),
+            ),
+            parse_mode="HTML",
+            reply_markup=main_channel_keyboard(),
         )
         await query.answer("File sent")
     except Exception:
@@ -375,13 +401,376 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def load_destination_history(client: TelegramClient) -> bool:
+    global DESTINATION_HISTORY_VERIFIED
+    if not DESTINATION_CHANNEL_ID:
+        DESTINATION_HISTORY_VERIFIED = False
+        return False
+    try:
+        target = await client.get_entity(chat_reference(DESTINATION_CHANNEL_ID))
+        checked = 0
+        async for message in client.iter_messages(target, wait_time=1):
+            forwarded = getattr(message, "fwd_from", None)
+            source_peer = getattr(forwarded, "from_id", None) if forwarded else None
+            source_message_id = getattr(forwarded, "channel_post", None) if forwarded else None
+            if source_peer is None or source_message_id is None:
+                continue
+            try:
+                source_chat_id = utils.get_peer_id(source_peer)
+            except Exception:
+                continue
+            if source_chat_id in SOURCE_CHAT_IDS:
+                FORWARDED_SOURCE_MESSAGES.add((source_chat_id, int(source_message_id)))
+            checked += 1
+        DESTINATION_HISTORY_VERIFIED = True
+        logger.info("Destination history scan complete; checked %d published posts", checked)
+        return True
+    except Exception as exc:
+        DESTINATION_HISTORY_VERIFIED = False
+        logger.warning("Could not inspect destination history (%s)", type(exc).__name__)
+        return False
+
+
+def media_caption(file_name: str | None, file_kind: str | None, source_caption: str = "") -> str:
+    label = source_caption.strip() if file_kind == "photo" else (file_name or "Movie file")
+    if not label:
+        label = "Movie poster" if file_kind == "photo" else "Movie file"
+    return f"🎬 <code>{html.escape(label[:180])}</code>"
+
+
+def main_channel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("MF OTT Updates", url=MAIN_CHANNEL_URL)]]
+    )
+
+
+async def forward_source_once(
+    application: Application,
+    source_chat_id: int,
+    message_id: int,
+    file_name: str | None = None,
+    file_kind: str | None = None,
+    source_caption: str = "",
+) -> str:
+    global LAST_FORWARD_AT
+    if not DESTINATION_CHANNEL_ID:
+        return "disabled"
+    key = (int(source_chat_id), int(message_id))
+    async with FORWARD_LOCK:
+        if key in FORWARDED_SOURCE_MESSAGES:
+            return "duplicate"
+        loop = asyncio.get_running_loop()
+        delay = FORWARD_INTERVAL_SECONDS - (loop.time() - LAST_FORWARD_AT)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        caption = media_caption(file_name, file_kind, source_caption)
+        keyboard = main_channel_keyboard()
+        for attempt in range(3):
+            try:
+                sent_message = await application.bot.forward_message(
+                    chat_id=chat_reference(DESTINATION_CHANNEL_ID),
+                    from_chat_id=int(source_chat_id),
+                    message_id=int(message_id),
+                )
+                FORWARDED_SOURCE_MESSAGES.add(key)
+                try:
+                    for edit_attempt in range(3):
+                        try:
+                            await application.bot.edit_message_caption(
+                                chat_id=chat_reference(DESTINATION_CHANNEL_ID),
+                                message_id=sent_message.message_id,
+                                caption=caption,
+                                parse_mode="HTML",
+                                reply_markup=keyboard,
+                            )
+                            break
+                        except RetryAfter as edit_exc:
+                            retry_after = (
+                                edit_exc.retry_after.total_seconds()
+                                if hasattr(edit_exc.retry_after, "total_seconds")
+                                else float(edit_exc.retry_after)
+                            )
+                            await asyncio.sleep(max(retry_after + 0.5, FORWARD_INTERVAL_SECONDS))
+                    else:
+                        raise RuntimeError("Caption update retries exhausted")
+                except Exception as exc:
+                    logger.warning(
+                        "Caption/button update failed for source message %s/%s (%s)",
+                        source_chat_id,
+                        message_id,
+                        type(exc).__name__,
+                    )
+                    try:
+                        await application.bot.delete_message(
+                            chat_id=chat_reference(DESTINATION_CHANNEL_ID),
+                            message_id=sent_message.message_id,
+                        )
+                        FORWARDED_SOURCE_MESSAGES.discard(key)
+                    except Exception:
+                        pass
+                    return "failed"
+                LAST_FORWARD_AT = loop.time()
+                return "sent"
+            except RetryAfter as exc:
+                retry_after = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
+                await asyncio.sleep(max(retry_after + 0.5, FORWARD_INTERVAL_SECONDS))
+            except Exception as exc:
+                logger.warning(
+                    "Forward failed for source message %s/%s (%s)",
+                    source_chat_id,
+                    message_id,
+                    type(exc).__name__,
+                )
+                return "failed"
+        logger.warning("Forward retries exhausted for source message %s/%s", source_chat_id, message_id)
+        return "failed"
+
+
+async def notify_admin_share_all(application: Application) -> None:
+    global SHARE_PROMPT_SENT
+    if SHARE_PROMPT_SENT or not ADMIN_ID or not DESTINATION_CHANNEL_ID or not ARCHIVE_SCAN_COMPLETE:
+        return
+    if not MT_CLIENT or (
+        not DESTINATION_HISTORY_VERIFIED and not await load_destination_history(MT_CLIENT)
+    ):
+        try:
+            await application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    "<b>MF MOVIE VAULT · SETUP NEEDED</b>\n"
+                    "I could not inspect the destination channel history. Add the Telegram account used by "
+                    "<code>TELEGRAM_SESSION_STRING</code> to the destination channel, and make the bot an administrator there."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logger.warning("Could not notify the configured admin (%s)", type(exc).__name__)
+        return
+    try:
+        bot_member = await application.bot.get_chat_member(
+            chat_id=chat_reference(DESTINATION_CHANNEL_ID),
+            user_id=application.bot.id,
+        )
+        if bot_member.status not in {"administrator", "creator"}:
+            await application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="<b>MF MOVIE VAULT · SETUP NEEDED</b>\nMake the bot an administrator in the configured destination channel, then try /shareall.",
+                parse_mode="HTML",
+            )
+            return
+    except Exception as exc:
+        logger.warning("Could not verify destination permissions (%s)", type(exc).__name__)
+        return
+
+    media_count = len(MEMORY_INDEX)
+    if not media_count:
+        try:
+            await application.bot.send_message(
+                chat_id=ADMIN_ID,
+                text="<b>MF MOVIE VAULT</b>\nThe archive scan found no files or poster images to share.",
+                parse_mode="HTML",
+            )
+            SHARE_PROMPT_SENT = True
+        except Exception as exc:
+            logger.warning("Could not notify the configured admin (%s)", type(exc).__name__)
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Share all archive files + posters", callback_data="publish:all")],
+            [InlineKeyboardButton("Cancel", callback_data="publish:cancel")],
+        ]
+    )
+    try:
+        await application.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "<b>✦ MF MOVIE VAULT · ADMIN REVIEW</b>\n\n"
+                f"Archive scan is complete: <b>{media_count}</b> media posts, including available posters.\n"
+                f"Destination: <code>{html.escape(DESTINATION_CHANNEL_ID)}</code>\n\n"
+                "Press <b>Share all</b> to forward the archive. New source-channel media will also be forwarded "
+                "automatically. Each post is spaced by at least 3 seconds."
+            ),
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        SHARE_PROMPT_SENT = True
+    except Exception as exc:
+        logger.warning("Could not send the admin approval prompt (%s); open the bot and use /shareall", type(exc).__name__)
+
+
+async def bulk_share_archive(application: Application, status_chat_id: int, status_message_id: int) -> None:
+    global BULK_FORWARD_TASK
+    scanned = sent = duplicate = failed = 0
+    try:
+        if not MT_CLIENT or not DESTINATION_CHANNEL_ID or not DESTINATION_HISTORY_VERIFIED:
+            await application.bot.edit_message_text(
+                chat_id=status_chat_id,
+                message_id=status_message_id,
+                text="Sharing stopped: archive session or destination history check is unavailable.",
+            )
+            return
+        for source in TELEGRAM_SOURCE_CHATS:
+            entity = await MT_CLIENT.get_entity(chat_reference(source))
+            source_chat_id = utils.get_peer_id(entity)
+            async for message in MT_CLIENT.iter_messages(entity, reverse=True, wait_time=1):
+                if not telethon_file_details(message):
+                    continue
+                scanned += 1
+                details = telethon_file_details(message)[0]
+                result = await forward_source_once(
+                    application,
+                    source_chat_id,
+                    message.id,
+                    file_name=details["name"],
+                    file_kind=details["kind"],
+                    source_caption=message.message or "",
+                )
+                if result == "sent":
+                    sent += 1
+                elif result == "duplicate":
+                    duplicate += 1
+                else:
+                    failed += 1
+                if scanned % 20 == 0:
+                    await application.bot.edit_message_text(
+                        chat_id=status_chat_id,
+                        message_id=status_message_id,
+                        text=(f"Forwarding archive…\nChecked: {scanned} · Sent: {sent} · "
+                              f"Already shared: {duplicate} · Failed: {failed}"),
+                    )
+        await application.bot.edit_message_text(
+            chat_id=status_chat_id,
+            message_id=status_message_id,
+            text=(f"<b>MF MOVIE VAULT · SHARE COMPLETE</b>\nSent: <b>{sent}</b>\n"
+                  f"Already shared: <b>{duplicate}</b>\nFailed: <b>{failed}</b>"),
+            parse_mode="HTML",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Bulk archive forwarding stopped (%s)", type(exc).__name__)
+        try:
+            await application.bot.edit_message_text(
+                chat_id=status_chat_id,
+                message_id=status_message_id,
+                text=f"Sharing stopped after {scanned} media posts; sent {sent}, skipped {duplicate}, failed {failed}.",
+            )
+        except Exception:
+            pass
+    finally:
+        BULK_FORWARD_TASK = None
+
+
+async def publish_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global BULK_FORWARD_TASK, SHARE_PROMPT_SENT
+    query = update.callback_query
+    if not query:
+        return
+    if not ADMIN_ID or query.from_user.id != ADMIN_ID:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    if query.data == "publish:cancel":
+        SHARE_PROMPT_SENT = False
+        await query.answer("Cancelled")
+        await query.edit_message_text("Archive sharing cancelled. Use /shareall when you are ready.")
+        return
+    if not MT_CLIENT or not DESTINATION_CHANNEL_ID:
+        await query.answer("Archive or destination is not configured.", show_alert=True)
+        return
+    if BULK_FORWARD_TASK and not BULK_FORWARD_TASK.done():
+        await query.answer("Archive sharing is already running.", show_alert=True)
+        return
+    if not DESTINATION_HISTORY_VERIFIED and not await load_destination_history(MT_CLIENT):
+        await query.answer("Could not verify destination history; check session access.", show_alert=True)
+        return
+    await query.answer("Admin approval received")
+    status = await context.bot.send_message(chat_id=query.message.chat_id, text="Preparing archive forwarding…")
+    await query.edit_message_text("Share all approved. Forwarding will proceed one post every 3 seconds.")
+    BULK_FORWARD_TASK = asyncio.create_task(
+        bulk_share_archive(context.application, status.chat_id, status.message_id)
+    )
+
+
+async def share_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global SHARE_PROMPT_SENT
+    user_id = update.effective_user.id if update.effective_user else None
+    message = update.effective_message
+    if not ADMIN_ID or user_id != ADMIN_ID:
+        await message.reply_text("This admin command is restricted.")
+        return
+    if not ARCHIVE_SCAN_COMPLETE:
+        await message.reply_text("Archive history is still being scanned. Try /shareall again shortly.")
+        return
+    SHARE_PROMPT_SENT = False
+    await notify_admin_share_all(context.application)
+
+
+async def destination_membership_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global DESTINATION_CHANNEL_ID
+    change = update.my_chat_member
+    chat = update.effective_chat
+    if not change or not chat or chat.type != "channel":
+        return
+    if not ADMIN_ID or change.from_user.id != ADMIN_ID:
+        return
+    if change.new_chat_member.status not in {"administrator", "creator"}:
+        return
+    if DESTINATION_CHANNEL_ID:
+        try:
+            configured = await context.bot.get_chat(chat_reference(DESTINATION_CHANNEL_ID))
+            if configured.id != chat.id:
+                logger.info("Ignoring bot promotion in a channel other than the configured destination")
+                return
+        except Exception as exc:
+            logger.warning("Could not verify the configured destination (%s)", type(exc).__name__)
+            return
+    else:
+        DESTINATION_CHANNEL_ID = str(chat.id)
+        logger.info("Detected the destination channel; set DESTINATION_CHANNEL_ID in Render for restart persistence")
+    if MT_CLIENT:
+        await load_destination_history(MT_CLIENT)
+    if ARCHIVE_SCAN_COMPLETE:
+        await notify_admin_share_all(context.application)
+
+
+def bot_message_media_details(message) -> dict[str, str] | None:
+    for attribute, fallback, kind in (
+        ("document", "document", "document"),
+        ("video", "video.mp4", "video"),
+        ("audio", "audio", "audio"),
+        ("voice", "voice.ogg", "voice"),
+        ("animation", "animation.mp4", "animation"),
+        ("video_note", "video-note.mp4", "video"),
+    ):
+        item = getattr(message, attribute, None)
+        if item:
+            return {"name": getattr(item, "file_name", None) or fallback, "kind": kind}
+    if getattr(message, "photo", None):
+        return {"name": "photo.jpg", "kind": "photo"}
+    return None
+
+
 async def on_bot_file_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if message:
-        index_bot_message(message)
+    if not message:
+        return
+    index_bot_message(message)
+    details = bot_message_media_details(message)
+    if AUTO_FORWARD_NEW and message.chat.id in SOURCE_CHAT_IDS and details:
+        await forward_source_once(
+            context.application,
+            message.chat.id,
+            message.message_id,
+            file_name=details["name"],
+            file_kind=details["kind"],
+            source_caption=message.caption or "",
+        )
 
 
 async def backfill_history(sources: list[tuple], client: TelegramClient) -> None:
+    global ARCHIVE_SCAN_COMPLETE
+    completed_sources = 0
     for entity, chat_id, title, username in sources:
         try:
             count = 0
@@ -393,11 +782,15 @@ async def backfill_history(sources: list[tuple], client: TelegramClient) -> None
             with INDEX_LOCK:
                 SOURCE_STATE.setdefault(chat_id, {"chat_title": title, "latest_seen_id": 0})
                 SOURCE_STATE[chat_id]["history_complete"] = True
+            completed_sources += 1
             logger.info("Archive history scan complete for %s", title)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Archive scan failed for a configured source")
+    ARCHIVE_SCAN_COMPLETE = bool(sources) and completed_sources == len(sources)
+    if ARCHIVE_SCAN_COMPLETE and BOT_APP:
+        await notify_admin_share_all(BOT_APP)
 
 
 async def configure_bot(app: Application) -> None:
@@ -406,6 +799,7 @@ async def configure_bot(app: Application) -> None:
             BotCommand("search", "Search by filename"),
             BotCommand("sources", "Archive channel status"),
             BotCommand("status", "Index status"),
+            BotCommand("shareall", "Admin: review archive forwarding"),
             BotCommand("help", "Usage guide"),
         ]
     )
@@ -466,9 +860,21 @@ async def start_mtproto() -> tuple[TelegramClient | None, list[tuple]]:
                 chat_id = utils.get_peer_id(event.chat)
                 _, resolved_chat_id, title, username = next(item for item in sources if item[1] == chat_id)
                 index_telethon_message(event.message, resolved_chat_id, title, username)
+                details = telethon_file_details(event.message)
+                if AUTO_FORWARD_NEW and BOT_APP and details:
+                    await forward_source_once(
+                        BOT_APP,
+                        resolved_chat_id,
+                        event.message.id,
+                        file_name=details[0]["name"],
+                        file_kind=details[0]["kind"],
+                        source_caption=event.message.message or "",
+                    )
             except Exception:
                 logger.exception("New archive message indexing failed")
 
+        if DESTINATION_CHANNEL_ID:
+            await load_destination_history(client)
         logger.info("Telegram session ready for %d configured archive source(s)", len(sources))
         return client, sources
     except Exception:
@@ -486,7 +892,10 @@ async def lifespan(app: FastAPI):
         BOT_APP.add_handler(CommandHandler("search", search_command))
         BOT_APP.add_handler(CommandHandler("sources", sources_command))
         BOT_APP.add_handler(CommandHandler("status", status_command))
+        BOT_APP.add_handler(CommandHandler("shareall", share_all_command))
         BOT_APP.add_handler(CallbackQueryHandler(share_result, pattern=r"^share:"))
+        BOT_APP.add_handler(CallbackQueryHandler(publish_callback, pattern=r"^publish:"))
+        BOT_APP.add_handler(ChatMemberHandler(destination_membership_update, ChatMemberHandler.MY_CHAT_MEMBER))
         from telegram.ext import MessageHandler, filters
         BOT_APP.add_handler(MessageHandler(filters.ALL, on_bot_file_message), group=10)
         await BOT_APP.initialize()
@@ -525,6 +934,9 @@ async def healthz():
         "bot_configured": bool(BOT_TOKEN),
         "archive_session_configured": bool(TELEGRAM_SESSION_STRING and TELEGRAM_SOURCE_CHATS),
         "force_join_configured": bool(FORCE_JOIN_CHANNEL_ID),
+        "admin_configured": bool(ADMIN_ID),
+        "destination_configured": bool(DESTINATION_CHANNEL_ID),
+        "auto_forward_new": AUTO_FORWARD_NEW,
     }
 
 
@@ -534,7 +946,7 @@ async def home():
         "service": "MF MOVIE VAULT Telegram Bot",
         "archive": "Telegram source channels; in-memory index rebuilt on startup",
         "health": "/healthz",
-        "commands": ["/search", "/sources", "/status", "/help"],
+        "commands": ["/search", "/sources", "/status", "/shareall", "/help"],
     }
 
 

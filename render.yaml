@@ -18,6 +18,12 @@ services:
         sync: false
       - key: TELEGRAM_SOURCE_CHATS
         sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: DESTINATION_CHANNEL_ID
+        sync: false
+      - key: AUTO_FORWARD_NEW
+        sync: false
       - key: FORCE_JOIN_CHANNEL_ID
         sync: false
       - key: FORCE_JOIN_CHANNEL_URL
