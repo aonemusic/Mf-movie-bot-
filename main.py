@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager
 
@@ -16,6 +17,27 @@ from telethon.sessions import StringSession
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("mf-movie-forwarder")
+
+
+class TelegramTokenRedactionFilter(logging.Filter):
+    """Redact Bot API tokens from any HTTP-library message before it is emitted."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        redacted = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+for handler in logging.getLogger().handlers:
+    handler.addFilter(TelegramTokenRedactionFilter())
+# httpx INFO messages include the full Bot API URL, which contains BOT_TOKEN.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET", "")
