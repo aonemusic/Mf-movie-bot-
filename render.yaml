@@ -20,15 +20,11 @@ services:
         sync: false
       - key: ADMIN_ID
         sync: false
+      - key: APPROVED_DESTINATION_CHANNEL_IDS
+        sync: false
       - key: DESTINATION_CHANNEL_ID
         sync: false
       - key: AUTO_FORWARD_NEW
-        sync: false
-      - key: FORCE_JOIN_CHANNEL_ID
-        sync: false
-      - key: FORCE_JOIN_CHANNEL_URL
-        sync: false
-      - key: BOT_ALLOWED_USER_IDS
         sync: false
       - key: BOT_WEBHOOK_SECRET
         sync: false

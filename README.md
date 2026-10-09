@@ -1,57 +1,55 @@
-# MF Movie Vault — Telegram Movie Archive Forwarder
+# MF MOVIE FORWARDER
 
-A Telegram Bot API + Telethon service for an authorized movie archive stored in Telegram. It indexes filenames (captions are optional), can send an admin an approval prompt to forward the existing archive, and can automatically forward new media posts and poster images to one configured destination channel.
+A Telegram-only channel forwarder for an authorized media archive. It has **no search feature** and does not send archive files to users in private chats. Its job is to forward archive files and posters into destination channels approved by the configured admin.
 
-## Archive and forwarding behavior
+## What the bot does
 
-- The configured `TELEGRAM_SOURCE_CHATS` channel(s) are the archive/database; no `DATABASE_URL` is used.
-- Once the source history scan completes, the bot privately sends the configured admin a **Share all archive files + posters** button. Nothing from the existing archive is bulk-published until the admin presses it.
-- Each eligible source media post is forwarded as an individual Telegram post. The file's actual filename (for example, `Movie.Name.mkv`) becomes its caption; a separate poster/photo post is included with its source title where available.
-- Every forwarded media post gets an inline **MF Main Channel** button linking to [https://t.me/mfmainchannel](https://t.me/mfmainchannel).
-- New source-channel media posts are automatically forwarded when `AUTO_FORWARD_NEW` is true (the default). Set it to `false` to disable live forwarding.
-- Forwarding is serialized with a minimum 3-second interval between posts. Telegram `RetryAfter` responses are respected. Existing destination posts are checked for source-forward references to reduce duplicates after restarts.
-- Only one destination channel is supported. This does not rotate channels or bypass protected-content restrictions, removals, or copyright claims. Forward only media you own or are authorized to distribute.
-- Render Free services can sleep/restart; the archive index is rebuilt from Telegram history after startup.
+- Uses the Telegram channel(s) in `TELEGRAM_SOURCE_CHATS` as the file archive; there is no separate database.
+- Scans the existing source-channel history, including files without captions. A filename such as `Movie.Name.mkv` is preserved as the forwarded post caption; poster/photo posts use their source caption when available.
+- When the configured `ADMIN_ID` makes the bot an administrator in a destination channel, the bot sends that admin a private **Yes — share archive / No — cancel** prompt for that channel.
+- A **Yes** approval forwards the existing files and posters to that destination, one post at a time, with a minimum **3-second interval** between outgoing posts. Every destination has its own approval; the same archive may be approved for multiple channels.
+- New source-channel media is automatically forwarded to **all approved destinations** when `AUTO_FORWARD_NEW` is `true` (the default).
+- Each forwarded post has an inline **MF Main Channel** button linking to [https://t.me/mfmainchannel](https://t.me/mfmainchannel).
+- Existing destination history is checked for source-forward references to reduce duplicates after restarts. Forwarded source files remain in Telegram; the bot does not download or store them elsewhere.
+- It does not rotate channels, remove protections, bypass Telegram restrictions, or evade copyright claims. Forward only content you own or are authorized to distribute.
 
-## Render Environment variables
+## Render environment variables
 
-Add values in Render **Environment** settings. Never put secret values in GitHub or send them in chat.
+Add these in Render **Environment**. Never put secret values in GitHub or send them in chat.
 
-| Required variable | Purpose |
-|---|---|
-| `BOT_TOKEN` | BotFather token. Secret. |
-| `TELEGRAM_API_ID` | Numeric app ID from `my.telegram.org/apps`. |
-| `TELEGRAM_API_HASH` | Telegram API hash. Secret. |
-| `TELEGRAM_SESSION_STRING` | Authorized Telethon StringSession. High-sensitivity account credential. |
-| `TELEGRAM_SOURCE_CHATS` | Archive/database channel ID(s) or username(s), comma-separated. |
-| `FORCE_JOIN_CHANNEL_ID` | Channel users must join before using search. |
-| `ADMIN_ID` | Numeric Telegram user ID allowed to approve bulk sharing and manage the forwarding prompt. |
-| `DESTINATION_CHANNEL_ID` | Public destination channel ID, usually `-100…`. Set this for restart-safe operation. If empty, a channel can be detected when this admin promotes the bot, but the detected ID is only held in memory until saved here. |
+| Variable | Required | Purpose |
+|---|---:|---|
+| `BOT_TOKEN` | Yes | Telegram bot token from BotFather. Secret. |
+| `TELEGRAM_API_ID` | Yes | Numeric app ID from `my.telegram.org/apps`. |
+| `TELEGRAM_API_HASH` | Yes | Telegram API hash. Secret. |
+| `TELEGRAM_SESSION_STRING` | Yes | Authorized Telethon `StringSession`; high-sensitivity account credential. |
+| `TELEGRAM_SOURCE_CHATS` | Yes | Archive/database channel ID(s) or usernames, comma-separated. |
+| `ADMIN_ID` | Yes | Numeric Telegram user ID that may approve destination channels and bulk sharing. |
+| `APPROVED_DESTINATION_CHANNEL_IDS` | Recommended | Comma-separated IDs of destinations already approved. Add a channel ID here after tapping **Yes** so its approval survives a Render restart. The bot resumes approved forwarding after the archive scan. |
+| `AUTO_FORWARD_NEW` | No | Defaults to `true`; set `false` to disable forwarding of new source posts. |
+| `BOT_WEBHOOK_SECRET` | No | Custom webhook secret; if empty, a random value is generated at startup. |
+| `LOG_LEVEL` | No | Python logging level; defaults to `INFO`. |
+| `DESTINATION_CHANNEL_ID` | Legacy only | Older single-destination setting. If present but not in `APPROVED_DESTINATION_CHANNEL_IDS`, it triggers a fresh Yes/No approval prompt. Prefer the plural variable. |
 
-Optional:
-
-- `AUTO_FORWARD_NEW`: defaults to `true`; set `false` to stop automatic forwarding of newly posted source media.
-- `FORCE_JOIN_CHANNEL_URL`: public channel URL or invite link for the Join button.
-- `BOT_ALLOWED_USER_IDS`: comma-separated numeric IDs for an additional allow-list; the configured `ADMIN_ID` remains an admin.
-- `BOT_WEBHOOK_SECRET`: custom webhook secret; if empty, a random value is generated at startup.
+`FORCE_JOIN_CHANNEL_ID`, `FORCE_JOIN_CHANNEL_URL`, and `BOT_ALLOWED_USER_IDS` are not used by this forwarding-only bot. `DATABASE_URL` is not used.
 
 ## Permissions and first-time setup
 
-1. The admin must open the bot and send `/start` once so it can deliver the private approval prompt.
-2. Add the bot as an administrator to the archive source channel(s) and the destination channel. The bot needs permission to post in the destination.
-3. The Telegram account represented by `TELEGRAM_SESSION_STRING` must be able to read the archive history and destination history. This is used to index sources and check which source posts were already forwarded.
-4. Add the bot to the force-join channel with permission to check membership.
-5. Set `ADMIN_ID` and `DESTINATION_CHANNEL_ID` in Render, then restart/redeploy. When the archive scan finishes, review the bot's private prompt and press **Share all archive files + posters** only when ready.
+1. Open the bot and send `/start` as the configured admin before promoting it. Telegram does not let a bot initiate a private conversation with a user who has never started it.
+2. Set the environment variables above in the Render service. Keep secret values in Render only.
+3. Add the Telegram account represented by `TELEGRAM_SESSION_STRING` to each source archive channel so it can read old history.
+4. Add the bot as an administrator to each source channel so it can receive channel posts. Add it as an administrator with posting permission to every destination channel.
+5. The Telegram account represented by `TELEGRAM_SESSION_STRING` must also be able to read each destination channel's history for duplicate detection.
+6. When the configured `ADMIN_ID` promotes the bot in a non-source channel, the bot sends a private approval prompt for that specific channel. Tap **Yes — share archive** to start the initial archive forwarding. Tap **No — cancel** to leave that channel unapproved.
+7. After approval, add that channel's numeric ID to `APPROVED_DESTINATION_CHANNEL_IDS` (comma-separated). Bot-button approvals otherwise remain in memory and are lost if the free Render service restarts.
 
-If the admin prompt does not arrive, send `/shareall` in the bot chat. The `/shareall` command and approval button are restricted to `ADMIN_ID`.
+## Admin commands and health
 
-## Commands and health
+- `/start` — forwarder status and setup reminder.
+- `/shareall` — reissue an approval prompt for each known channel; it never starts bulk sharing without a fresh **Yes**.
+- `/status` — show archive scan and approved/pending destination status.
+- `/healthz` — report configuration-presence flags and counts only; it does not reveal or validate credential values.
 
-- `/search <filename or words> [page]` — search filenames/captions, including captionless files.
-- `/sources` — source channels and history scan status.
-- `/status` — indexed counts.
-- `/shareall` — admin-only request to review the bulk-share approval.
-- `/help` — usage guide.
-- `/healthz` reports whether configuration fields are present; it does not validate credential values.
+Render Free services may sleep or restart. The Telegram channels remain the source of truth, and the archive is scanned again at startup. Make sure approved destination IDs are saved in `APPROVED_DESTINATION_CHANNEL_IDS` for restart persistence.
 
-The source-of-truth files remain in Telegram. `.env` and `.env.*` are ignored by Git.
+`.env` and `.env.*` are ignored by Git. Never commit Telegram tokens, API hashes, or session strings.
