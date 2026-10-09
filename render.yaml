@@ -10,21 +10,25 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: TELEGRAM_API_ID
-        sync: false
-      - key: TELEGRAM_API_HASH
-        sync: false
-      - key: TELEGRAM_SESSION_STRING
+      - key: ADMIN_ID
         sync: false
       - key: TELEGRAM_SOURCE_CHATS
-        sync: false
-      - key: ADMIN_ID
         sync: false
       - key: APPROVED_DESTINATION_CHANNEL_IDS
         sync: false
       - key: DESTINATION_CHANNEL_ID
         sync: false
       - key: AUTO_FORWARD_NEW
+        value: "true"
+      - key: FORCE_JOIN_CHANNEL_ID
+        sync: false
+      - key: FORCE_JOIN_CHANNEL_URL
+        sync: false
+      - key: FIREBASE_DATABASE_URL
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: BOT_WEBHOOK_SECRET
         sync: false
