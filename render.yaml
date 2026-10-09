@@ -28,3 +28,5 @@ services:
         sync: false
       - key: BOT_WEBHOOK_SECRET
         sync: false
+      - key: LOG_LEVEL
+        value: INFO

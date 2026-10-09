@@ -27,7 +27,17 @@ class TelegramTokenRedactionFilter(logging.Filter):
             message = record.getMessage()
         except Exception:
             return True
+        if record.exc_info:
+            try:
+                message = f"{message}\n{logging.Formatter().formatException(record.exc_info)}"
+            except Exception:
+                pass
+            record.exc_info = None
+            record.exc_text = None
         redacted = re.sub(r"bot\d+:[A-Za-z0-9_-]+", "bot[REDACTED]", message)
+        configured_token = os.getenv("BOT_TOKEN", "")
+        if configured_token:
+            redacted = redacted.replace(configured_token, "[REDACTED_BOT_TOKEN]")
         if redacted != message:
             record.msg = redacted
             record.args = ()
@@ -38,6 +48,22 @@ for handler in logging.getLogger().handlers:
     handler.addFilter(TelegramTokenRedactionFilter())
 # httpx INFO messages include the full Bot API URL, which contains BOT_TOKEN.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def parse_destination_channel_ids(raw_value: str) -> tuple[list[int], int]:
+    """Return valid negative Telegram channel IDs and the number of rejected entries."""
+    approved: list[int] = []
+    rejected = 0
+    for value in raw_value.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        if re.fullmatch(r"-\d{1,19}", value) and int(value) < 0:
+            approved.append(int(value))
+        else:
+            rejected += 1
+    return approved, rejected
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET", "")
@@ -52,11 +78,14 @@ TELEGRAM_SOURCE_CHATS = [
 ]
 _admin_id_value = os.getenv("ADMIN_ID", "").strip()
 ADMIN_ID = int(_admin_id_value) if _admin_id_value.isdigit() else 0
-APPROVED_DESTINATION_REFS = [
-    value.strip()
-    for value in os.getenv("APPROVED_DESTINATION_CHANNEL_IDS", "").split(",")
-    if value.strip()
-]
+APPROVED_DESTINATION_REFS, INVALID_DESTINATION_ID_COUNT = parse_destination_channel_ids(
+    os.getenv("APPROVED_DESTINATION_CHANNEL_IDS", "")
+)
+if INVALID_DESTINATION_ID_COUNT:
+    logger.warning(
+        "Ignored %d invalid APPROVED_DESTINATION_CHANNEL_IDS entr(y/ies); use numeric channel IDs",
+        INVALID_DESTINATION_ID_COUNT,
+    )
 # Compatibility only: this legacy single-channel value is treated as a pending
 # destination and still requires an explicit Yes approval.
 LEGACY_DESTINATION_REF = os.getenv("DESTINATION_CHANNEL_ID", "").strip()
@@ -133,7 +162,7 @@ def media_caption(file_name: str | None, file_kind: str | None, source_caption: 
     label = source_caption.strip() if file_kind == "photo" else (file_name or "Movie file")
     if not label:
         label = "Movie poster" if file_kind == "photo" else "Movie file"
-    return f"🎬 <code>{html.escape(label[:180])}</code>"
+    return f"🎬 <code>{html.escape(label[:900])}</code>"
 
 
 def main_channel_keyboard() -> InlineKeyboardMarkup:
@@ -291,6 +320,7 @@ async def forward_source_once(
                     from_chat_id=int(source_chat_id),
                     message_id=int(message_id),
                 )
+                LAST_FORWARD_AT = loop.time()
                 FORWARDED_SOURCE_MESSAGES.add(key)
                 try:
                     for edit_attempt in range(3):
@@ -329,7 +359,6 @@ async def forward_source_once(
                     except Exception:
                         pass
                     return "failed"
-                LAST_FORWARD_AT = loop.time()
                 return "sent"
             except RetryAfter as exc:
                 retry_after = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
@@ -557,8 +586,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await message.reply_text(
         "<b>MF MOVIE FORWARDER</b>\n"
-        "This bot forwards archive files and posters to channels you approve.\n\n"
-        "Use <code>/shareall</code> to repeat a destination approval prompt or <code>/status</code> for status.",
+        "This bot forwards archive files and posters only to destination channels you explicitly approve.\n\n"
+        "<b>Setup</b>\n"
+        "1. Configure BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, TELEGRAM_SESSION_STRING, "
+        "TELEGRAM_SOURCE_CHATS, and ADMIN_ID in Render Environment.\n"
+        "2. Add the session account to each source channel so it can read archive history; make this bot an "
+        "administrator in source channels and an administrator with posting permission in destinations.\n"
+        "3. Promote the bot in a destination channel and approve that channel using the private Yes/No buttons.\n"
+        "4. Add each approved numeric channel ID to APPROVED_DESTINATION_CHANNEL_IDS in Render Environment "
+        "to preserve approval after a restart.\n\n"
+        "Use <code>/shareall</code> to reissue approval prompts or <code>/status</code> for status. "
+        "The archive scan runs at startup; approved history sharing waits for it to finish. New media forwarding "
+        f"is {'enabled' if AUTO_FORWARD_NEW else 'disabled'}.",
         parse_mode="HTML",
     )
     for destination_id in list(KNOWN_DESTINATIONS):
@@ -594,7 +633,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not is_admin(user_id):
         await message.reply_text("This admin command is restricted.")
         return
-    scan_status = "Complete" if ARCHIVE_SCAN_COMPLETE else "In progress or unavailable"
+    if ARCHIVE_SCAN_COMPLETE:
+        scan_status = "Complete"
+    elif MT_CLIENT and BACKFILL_TASK and not BACKFILL_TASK.done():
+        scan_status = "In progress"
+    else:
+        scan_status = "Incomplete or unavailable"
     approved = [html.escape(title) for title in APPROVED_DESTINATIONS.values()]
     pending = [html.escape(title) for title in PENDING_DESTINATIONS.values()]
     approved_text = ", ".join(approved) if approved else "None"
@@ -824,12 +868,15 @@ async def healthz():
     return {
         "ok": True,
         "bot_configured": bool(BOT_TOKEN),
+        "bot_running": BOT_APP is not None,
         "archive_session_configured": bool(
             TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_SESSION_STRING and TELEGRAM_SOURCE_CHATS
         ),
+        "archive_session_ready": MT_CLIENT is not None,
         "archive_scan_complete": ARCHIVE_SCAN_COMPLETE,
         "archive_media_count": len(ARCHIVE_MEDIA_KEYS),
         "admin_configured": bool(ADMIN_ID),
+        "destination_configuration_present": bool(APPROVED_DESTINATION_REFS or LEGACY_DESTINATION_REF),
         "approved_destination_count": len(APPROVED_DESTINATIONS),
         "auto_forward_new": AUTO_FORWARD_NEW,
     }

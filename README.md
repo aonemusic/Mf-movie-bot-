@@ -4,7 +4,7 @@ A Telegram-only channel forwarder for an authorized media archive. It has **no s
 
 ## What the bot does
 
-- Uses the Telegram channel(s) in `TELEGRAM_SOURCE_CHATS` as the file archive; there is no separate database.
+- Uses the Telegram channel(s) in `TELEGRAM_SOURCE_CHATS` as the archive and source of truth; there is no separate database.
 - Scans the existing source-channel history, including files without captions. A filename such as `Movie.Name.mkv` is preserved as the forwarded post caption; poster/photo posts use their source caption when available.
 - When the configured `ADMIN_ID` makes the bot an administrator in a destination channel, the bot sends that admin a private **Yes — share archive / No — cancel** prompt for that channel.
 - A **Yes** approval forwards the existing files and posters to that destination, one post at a time, with a minimum **3-second interval** between outgoing posts. Every destination has its own approval; the same archive may be approved for multiple channels.
@@ -23,7 +23,7 @@ Add these in Render **Environment**. Never put secret values in GitHub or send t
 | `TELEGRAM_API_ID` | Yes | Numeric app ID from `my.telegram.org/apps`. |
 | `TELEGRAM_API_HASH` | Yes | Telegram API hash. Secret. |
 | `TELEGRAM_SESSION_STRING` | Yes | Authorized Telethon `StringSession`; high-sensitivity account credential. |
-| `TELEGRAM_SOURCE_CHATS` | Yes | Archive/database channel ID(s) or usernames, comma-separated. |
+| `TELEGRAM_SOURCE_CHATS` | Yes | Archive channel ID(s) or usernames, comma-separated. |
 | `ADMIN_ID` | Yes | Numeric Telegram user ID that may approve destination channels and bulk sharing. |
 | `APPROVED_DESTINATION_CHANNEL_IDS` | Recommended | Comma-separated IDs of destinations already approved. Add a channel ID here after tapping **Yes** so its approval survives a Render restart. The bot resumes approved forwarding after the archive scan. |
 | `AUTO_FORWARD_NEW` | No | Defaults to `true`; set `false` to disable forwarding of new source posts. |
@@ -41,7 +41,7 @@ Add these in Render **Environment**. Never put secret values in GitHub or send t
 4. Add the bot as an administrator to each source channel so it can receive channel posts. Add it as an administrator with posting permission to every destination channel.
 5. The Telegram account represented by `TELEGRAM_SESSION_STRING` must also be able to read each destination channel's history for duplicate detection.
 6. When the configured `ADMIN_ID` promotes the bot in a non-source channel, the bot sends a private approval prompt for that specific channel. Tap **Yes — share archive** to start the initial archive forwarding. Tap **No — cancel** to leave that channel unapproved.
-7. After approval, add that channel's numeric ID to `APPROVED_DESTINATION_CHANNEL_IDS` (comma-separated). Bot-button approvals otherwise remain in memory and are lost if the free Render service restarts.
+7. After approval, add that channel's numeric ID to `APPROVED_DESTINATION_CHANNEL_IDS` (comma-separated, preserving any IDs already present). Bot-button approvals otherwise remain in memory and are lost if the free Render service restarts.
 
 ## Admin commands and health
 
