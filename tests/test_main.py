@@ -137,6 +137,95 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertEqual(second_page.inline_keyboard[-1][0].text, "‹ Back")
         self.assertEqual(second_page.inline_keyboard[-1][1].text, "Next ›")
 
+    def test_group_result_buttons_open_bot_with_signed_file_payload(self):
+        with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+            main, "BOT_USERNAME", "mf_movie_library_bot"
+        ):
+            key = "-1004352245988_12345"
+            payload = main.make_file_start_payload(key)
+            self.assertLessEqual(len(payload), 64)
+            self.assertEqual(main.file_key_from_start_payload(payload), key)
+            self.assertIsNone(main.file_key_from_start_payload(payload + "x"))
+
+            keyboard = main.group_search_page_keyboard(
+                [(key, {"file_name": "Example.Movie.mkv", "file_size": 1024})],
+                "group-session",
+                0,
+            )
+            file_button, channel_button = keyboard.inline_keyboard[0]
+            self.assertEqual(file_button.url, f"https://t.me/mf_movie_library_bot?start={payload}")
+            self.assertTrue(file_button.text.startswith("1.0 KB · Example.Movie.mkv"))
+            self.assertEqual(channel_button.url, "https://t.me/mfmainchannel")
+
+    def test_group_search_returns_bot_deep_link_results_without_registering_group_user(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(type="supergroup"),
+            chat_id=-100123,
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=77))
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        async def run():
+            with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+                main, "BOT_USERNAME", "mf_movie_library_bot"
+            ), patch.object(
+                main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
+            ), patch.object(main, "send_chat_action", new=AsyncMock()), patch.object(
+                main, "register_user", new=AsyncMock()
+            ) as register, patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+                main, "firebase_ready", return_value=True
+            ), patch.object(main, "record_search", new=AsyncMock()), patch.object(
+                main,
+                "search_catalog",
+                new=AsyncMock(return_value=[("-1001_9", {"file_name": "Movie.mkv", "file_size": 2048})]),
+            ):
+                await main.search_command(update, context, "Movie")
+                register.assert_not_awaited()
+            markup = message.reply_text.await_args.kwargs["reply_markup"]
+            self.assertTrue(markup.inline_keyboard[0][0].url.startswith("https://t.me/mf_movie_library_bot?start="))
+        asyncio.run(run())
+
+    def test_signed_group_start_delivers_file_and_expires_file_and_notice(self):
+        bot = SimpleNamespace(
+            send_chat_action=AsyncMock(),
+            copy_message=AsyncMock(return_value=SimpleNamespace(message_id=501)),
+            send_message=AsyncMock(return_value=SimpleNamespace(message_id=502)),
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(type="private"),
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=77))
+        context = SimpleNamespace(bot=bot)
+
+        async def run():
+            with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+                main, "register_user", new=AsyncMock()
+            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1002"), patch.object(
+                main, "is_user_member", new=AsyncMock(return_value=True)
+            ), patch.object(main, "firebase_ready", return_value=True), patch.object(
+                main,
+                "get_catalog_entry",
+                new=AsyncMock(return_value={
+                    "media_type": "video",
+                    "source_chat_id": -1001,
+                    "source_message_id": 9,
+                    "file_name": "Movie.mkv",
+                }),
+            ), patch.object(main, "persist_pending_delete", new=AsyncMock()) as persist, patch.object(
+                main, "schedule_file_deletion"
+            ) as schedule:
+                payload = main.make_file_start_payload("-1001_9")
+                await main.start_command(update, context, payload)
+                self.assertEqual(persist.await_count, 2)
+                self.assertEqual(schedule.call_count, 2)
+                self.assertEqual(schedule.call_args_list[0].args[-1], schedule.call_args_list[1].args[-1])
+
+        asyncio.run(run())
+        bot.copy_message.assert_awaited_once_with(chat_id=77, from_chat_id=-1001, message_id=9)
+        self.assertIn("removed automatically", bot.send_message.await_args.kwargs["text"])
+
     def test_request_keyboard_has_callback_and_green_style(self):
         previous = dict(main.MOVIE_REQUEST_SESSIONS)
         try:
@@ -224,8 +313,9 @@ class SearchAndMediaTests(unittest.TestCase):
             ) as schedule:
                 await main.file_button_callback(update, context)
                 await main.file_button_callback(update, context)
-                self.assertEqual(persist.await_count, 1)
-                schedule.assert_called_once()
+                self.assertEqual(persist.await_count, 2)
+                self.assertEqual(schedule.call_count, 2)
+                self.assertEqual(schedule.call_args_list[0].args[-1], schedule.call_args_list[1].args[-1])
 
         asyncio.run(run())
         self.assertEqual(events, ["file", "results", "notice"])

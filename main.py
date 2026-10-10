@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import html
@@ -84,6 +85,7 @@ FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").s
 _ADMIN_VALUE = os.getenv("ADMIN_ID", "").strip()
 ADMIN_ID = int(_ADMIN_VALUE) if _ADMIN_VALUE.isdigit() else 0
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+BOT_USERNAME = ""
 DELETE_AFTER_SECONDS = 600
 MAX_SEARCH_RESULTS = 10
 REQUESTS_PER_PAGE = 20
@@ -227,6 +229,80 @@ def result_button_text(record: dict[str, Any]) -> str:
     if len(name) > 48:
         name = f"{name[:45]}…"
     return f"{format_file_size(record.get('file_size'))} · {name}"[:64]
+
+
+def _base36(value: int) -> str:
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyz"
+    if value == 0:
+        return "0"
+    output = ""
+    while value:
+        value, remainder = divmod(value, 36)
+        output = alphabet[remainder] + output
+    return output
+
+
+def make_file_start_payload(key: str) -> str:
+    match = re.fullmatch(r"(-?\d{1,19})_(\d{1,20})", key)
+    if not match or not BOT_TOKEN:
+        raise ValueError("Cannot create file link")
+    chat_id, message_id = int(match.group(1)), int(match.group(2))
+    compact = f"{'n' if chat_id < 0 else 'p'}_{_base36(abs(chat_id))}_{_base36(message_id)}"
+    tag = make_file_payload_signature(compact)
+    payload = f"f{compact}_{tag}"
+    if len(payload) > 64:
+        raise ValueError("File link payload is too long")
+    return payload
+
+
+def file_key_from_start_payload(payload: str) -> str | None:
+    if not BOT_TOKEN or not isinstance(payload, str) or not payload.startswith("f"):
+        return None
+    try:
+        prefix, chat_code, message_code, tag = payload.split("_", 3)
+        if prefix != "fn" and prefix != "fp":
+            return None
+        compact = f"{prefix[1:]}_{chat_code}_{message_code}"
+        expected = make_file_payload_signature(compact)
+        if not hmac.compare_digest(tag, expected):
+            return None
+        chat_id = int(chat_code, 36) * (-1 if prefix == "fn" else 1)
+        message_id = int(message_code, 36)
+        key = f"{chat_id}_{message_id}"
+        return key if re.fullmatch(r"-?\d{1,19}_\d{1,20}", key) else None
+    except (ValueError, TypeError):
+        return None
+
+
+def make_file_payload_signature(compact: str) -> str:
+    signature = hmac.new(BOT_TOKEN.encode(), compact.encode(), hashlib.sha256).digest()[:8]
+    return base64.urlsafe_b64encode(signature).decode().rstrip("=")
+
+
+def group_search_page_keyboard(
+    matches: list[tuple[str, dict[str, Any]]], token: str, offset: int
+) -> InlineKeyboardMarkup:
+    rows = []
+    file_styles = ("primary", "success", "danger")
+    for index, (key, record) in enumerate(matches[offset : offset + MAX_SEARCH_RESULTS]):
+        payload = make_file_start_payload(key)
+        file_url = f"https://t.me/{BOT_USERNAME}?start={payload}"
+        rows.append([
+            keyboard_button(
+                result_button_text(record),
+                url=file_url,
+                style=file_styles[(offset + index) % len(file_styles)],
+            ),
+            keyboard_button("Join Main Channel", url=MAIN_CHANNEL_URL, style="danger"),
+        ])
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(keyboard_button("‹ Back", callback_data=f"page:{token}:{max(0, offset - MAX_SEARCH_RESULTS)}"))
+    if offset + MAX_SEARCH_RESULTS < len(matches):
+        nav.append(keyboard_button("Next ›", callback_data=f"page:{token}:{offset + MAX_SEARCH_RESULTS}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
 
 
 def media_caption(record: dict[str, Any]) -> str:
@@ -445,11 +521,13 @@ def make_movie_request_session(user_id: int, title: str) -> str:
     return token
 
 
-def make_search_session(user_id: int, title: str) -> str:
+def make_search_session(user_id: int, title: str, *, chat_id: int | None = None, group: bool = False) -> str:
     token = new_session_token(user_id, title)
     SEARCH_SESSIONS[token] = {
         "user_id": user_id,
         "query": title[:180],
+        "chat_id": chat_id,
+        "group": group,
         "created_at": time.time(),
     }
     if len(SEARCH_SESSIONS) > 1000:
@@ -549,13 +627,33 @@ async def send_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str = "") -> None:
     message = update.effective_message
     user = update.effective_user
     if not message:
         return
     if user and message.chat.type == "private":
         await register_user(user)
+        if payload:
+            key = file_key_from_start_payload(payload)
+            if not key:
+                await message.reply_text(
+                    "<b>FILE LINK EXPIRED</b>\n\nPlease search again in the group for a fresh link.",
+                    parse_mode="HTML",
+                )
+                return
+            if not FORCE_JOIN_CHANNEL_ID or not await is_user_member(context.bot, user.id):
+                join_keyboard = await force_join_keyboard(context.bot)
+                rows = join_keyboard.inline_keyboard if join_keyboard else []
+                rows.append([keyboard_button("I have joined — send my file", callback_data=f"file:{key}")])
+                await message.reply_text(
+                    "<b>ONE LAST STEP</b>\n\nJoin our channel, then tap the button below to receive your selected file.",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(rows),
+                )
+                return
+            await deliver_group_file(update, context, key)
+            return
     await message.reply_text(
         "<b>MF MOVIE LIBRARY</b>\n"
         "<i>Your archive, beautifully within reach.</i>\n\n"
@@ -570,19 +668,66 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def deliver_group_file(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or message.chat.type != "private":
+        return
+    await send_chat_action(context.bot, user.id, "typing")
+    if not firebase_ready():
+        await message.reply_text("<b>DELIVERY TEMPORARILY UNAVAILABLE</b>\n\nPlease try again shortly.", parse_mode="HTML")
+        return
+    try:
+        record = await get_catalog_entry(key)
+    except Exception as exc:
+        logger.error("Firebase deep-link file lookup failed (%s)", type(exc).__name__)
+        await message.reply_text("<b>DELIVERY TEMPORARILY UNAVAILABLE</b>\n\nPlease try again shortly.", parse_mode="HTML")
+        return
+    if not record:
+        await message.reply_text("<b>FILE NO LONGER AVAILABLE</b>\n\nSearch again in the group for an updated result.", parse_mode="HTML")
+        return
+    await send_chat_action(context.bot, user.id, upload_action_for_media(str(record.get("media_type", "document"))))
+    try:
+        copied = await context.bot.copy_message(
+            chat_id=user.id,
+            from_chat_id=int(record["source_chat_id"]),
+            message_id=int(record["source_message_id"]),
+        )
+    except TelegramError as exc:
+        logger.info("Telegram could not deliver one group-selected file (%s)", type(exc).__name__)
+        await message.reply_text("<b>DELIVERY UNAVAILABLE</b>\n\nTelegram could not copy this item from the archive.", parse_mode="HTML")
+        return
+    delete_at = int(time.time()) + DELETE_AFTER_SECONDS
+    file_delete_key = f"{user.id}_{copied.message_id}"
+    file_delete_record = {"chat_id": int(user.id), "message_id": int(copied.message_id), "delete_at": delete_at}
+    await persist_pending_delete(file_delete_key, file_delete_record)
+    schedule_file_deletion(file_delete_key, user.id, copied.message_id, delete_at)
+    notice = await context.bot.send_message(
+        chat_id=user.id,
+        text=(
+            "<b>YOUR FILE IS READY</b>\n\n"
+            f"<code>{html.escape(str(record.get('file_name', 'File'))[:180])}</code> is now in this private chat. "
+            "The file and this message will be removed automatically in <b>10 minutes</b>."
+        ),
+        parse_mode="HTML",
+    )
+    notice_key = f"{user.id}_{notice.message_id}"
+    notice_record = {"chat_id": int(user.id), "message_id": int(notice.message_id), "delete_at": delete_at}
+    await persist_pending_delete(notice_key, notice_record)
+    schedule_file_deletion(notice_key, user.id, notice.message_id, delete_at)
+
+
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str) -> None:
     message = update.effective_message
     user = update.effective_user
     if not message or not user:
         return
-    if message.chat.type != "private":
-        await message.reply_text(
-            "<b>PRIVATE SEARCH</b>\n\nFor your privacy, please open a private chat with this bot and send your movie title there.",
-            parse_mode="HTML",
-        )
+    is_private = message.chat.type == "private"
+    if not is_private and message.chat.type not in {"group", "supergroup"}:
         return
     await send_chat_action(context.bot, user.id, "typing")
-    await register_user(user)
+    if is_private:
+        await register_user(user)
     if not FORCE_JOIN_CHANNEL_ID:
         await message.reply_text(
             "<b>CATALOG TEMPORARILY UNAVAILABLE</b>\n\nThe membership channel has not been configured yet. Please try again later.",
@@ -620,14 +765,26 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
             f"<b>NO MATCHES FOUND</b>\n\nWe couldn't find a file matching <code>{html.escape(query_text[:100])}</code>. "
             "Try a shorter title or another spelling. You can also send a request to the admin.",
             parse_mode="HTML",
-            reply_markup=no_results_keyboard(user.id, query_text),
+            reply_markup=no_results_keyboard(user.id, query_text) if is_private else None,
         )
         return
-    token = make_search_session(user.id, query_text)
+    if not is_private and not BOT_USERNAME:
+        await message.reply_text("<b>GROUP DELIVERY UNAVAILABLE</b>\n\nPlease use the bot in a private chat for now.", parse_mode="HTML")
+        return
+    token = make_search_session(
+        user.id,
+        query_text,
+        chat_id=int(message.chat_id),
+        group=not is_private,
+    )
     await message.reply_text(
         search_page_text(query_text, len(matches), 0),
         parse_mode="HTML",
-        reply_markup=search_page_keyboard(matches, token, 0),
+        reply_markup=(
+            search_page_keyboard(matches, token, 0)
+            if is_private
+            else group_search_page_keyboard(matches, token, 0)
+        ),
     )
 
 
@@ -863,7 +1020,7 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await persist_pending_delete(deletion_key, deletion_record)
         schedule_file_deletion(deletion_key, query.from_user.id, copied.message_id, delete_at)
         await remove_used_search_message(query, context)
-        await context.bot.send_message(
+        notice = await context.bot.send_message(
             chat_id=query.from_user.id,
             text=(
                 f"<b>DELIVERY COMPLETE</b>\n\n"
@@ -872,6 +1029,14 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             ),
             parse_mode="HTML",
         )
+        notice_key = f"{query.from_user.id}_{notice.message_id}"
+        notice_record = {
+            "chat_id": int(query.from_user.id),
+            "message_id": int(notice.message_id),
+            "delete_at": delete_at,
+        }
+        await persist_pending_delete(notice_key, notice_record)
+        schedule_file_deletion(notice_key, query.from_user.id, notice.message_id, delete_at)
     finally:
         ACTIVE_FILE_MESSAGES.discard(result_message_key)
 
@@ -1488,7 +1653,9 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     command, _, argument = content.partition(" ")
     command = command.split("@", 1)[0].lower()
     if command in {"/start", "/help"}:
-        await start_command(update, context)
+        await start_command(update, context, argument if command == "/start" else "")
+    elif command in {"/search", "/movie"}:
+        await search_command(update, context, argument)
     elif command in {"/status", "/stuts"}:
         if ADMIN_ID and user.id == ADMIN_ID:
             await status_command(update, context)
@@ -1508,10 +1675,12 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     if not query or not query.message or not query.from_user:
         return
-    if query.message.chat.type != "private":
-        await query.answer("Search results are available in your private chat.", show_alert=True)
+    is_private = query.message.chat.type == "private"
+    if not is_private and query.message.chat.type not in {"group", "supergroup"}:
+        await query.answer("Search results are not available in this chat.", show_alert=True)
         return
-    await register_user(query.from_user)
+    if is_private:
+        await register_user(query.from_user)
     try:
         _, token, raw_offset = (query.data or "").split(":", 2)
         offset = int(raw_offset)
@@ -1519,7 +1688,12 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("This results page is invalid. Search again.", show_alert=True)
         return
     session = SEARCH_SESSIONS.get(token)
-    if not session or session.get("user_id") != query.from_user.id:
+    if (
+        not session
+        or session.get("user_id") != query.from_user.id
+        or bool(session.get("group")) == is_private
+        or (session.get("chat_id") is not None and int(session["chat_id"]) != int(query.message.chat_id))
+    ):
         await query.answer("This results page has expired. Search again.", show_alert=True)
         return
     if not await is_user_member(context.bot, query.from_user.id):
@@ -1546,7 +1720,11 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"<b>NO MATCHES FOUND</b>\n\nWe couldn't find <code>{html.escape(str(session['query'])[:100])}</code>. "
             "Try another spelling or send a request to the admin.",
             parse_mode="HTML",
-            reply_markup=no_results_keyboard(query.from_user.id, str(session["query"])),
+            reply_markup=(
+                no_results_keyboard(query.from_user.id, str(session["query"]))
+                if is_private
+                else None
+            ),
         )
         SEARCH_SESSIONS.pop(token, None)
         return
@@ -1555,7 +1733,11 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.edit_message_text(
         search_page_text(str(session["query"]), len(matches), offset),
         parse_mode="HTML",
-        reply_markup=search_page_keyboard(matches, token, offset),
+        reply_markup=(
+            search_page_keyboard(matches, token, offset)
+            if is_private
+            else group_search_page_keyboard(matches, token, offset)
+        ),
     )
 
 
@@ -1574,9 +1756,13 @@ async def resolve_source_channels(application: Application) -> None:
 
 
 async def configure_bot(application: Application) -> None:
+    global BOT_USERNAME
+    bot_identity = await application.bot.get_me()
+    BOT_USERNAME = str(bot_identity.username or "").lstrip("@")
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Open the movie library"),
+            BotCommand("search", "Search the movie library"),
             BotCommand("status", "Admin: view realtime library statistics"),
             BotCommand("stuts", "Admin: view realtime library statistics"),
             BotCommand("request", "Admin: review movie requests"),
