@@ -19,7 +19,7 @@ import firebase_admin
 from fastapi import FastAPI, Header, HTTPException
 from firebase_admin import credentials, db
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, ContextTypes, TypeHandler
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -863,6 +863,10 @@ async def delete_delivered_file(key: str, chat_id: int, message_id: int, delete_
                 return
             except RetryAfter as exc:
                 await asyncio.sleep(max(retry_delay(exc) + 1, 1))
+            except BadRequest:
+                logger.info("Scheduled deletion target is already unavailable; clearing its retry record")
+                await clear_pending_delete(key)
+                return
             except TelegramError as exc:
                 logger.warning("Scheduled file deletion failed (%s)", type(exc).__name__)
                 if attempt == 2:

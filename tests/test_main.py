@@ -255,6 +255,19 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertEqual(main.upload_action_for_media("photo"), "upload_photo")
         self.assertEqual(main.upload_action_for_media("document"), "upload_document")
 
+    def test_permanently_missing_expiry_message_clears_pending_retry_record(self):
+        bot = SimpleNamespace(delete_message=AsyncMock(side_effect=main.BadRequest("message to delete not found")))
+
+        async def run():
+            with patch.object(main, "BOT_APP", SimpleNamespace(bot=bot)), patch.object(
+                main, "clear_pending_delete", new=AsyncMock()
+            ) as clear, patch.object(main.asyncio, "sleep", new=AsyncMock()):
+                await main.delete_delivered_file("77_501", 77, 501, int(time.time()) - 1)
+                bot.delete_message.assert_awaited_once_with(chat_id=77, message_id=501)
+                clear.assert_awaited_once_with("77_501")
+
+        asyncio.run(run())
+
     def test_successful_file_selection_sends_then_removes_search_results_and_blocks_duplicate(self):
         events = []
 
