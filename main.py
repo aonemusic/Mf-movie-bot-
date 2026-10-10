@@ -19,7 +19,7 @@ from fastapi import FastAPI, Header, HTTPException
 from firebase_admin import credentials, db
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import RetryAfter, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, ContextTypes, TypeHandler
+from telegram.ext import Application, ContextTypes, TypeHandler
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("mf-movie-search-bot")
@@ -53,18 +53,18 @@ for _handler in logging.getLogger().handlers:
     _handler.addFilter(SecretRedactionFilter())
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 BOT_WEBHOOK_SECRET = os.getenv("BOT_WEBHOOK_SECRET", "").strip()
 if BOT_WEBHOOK_SECRET:
     WEBHOOK_SECRET = BOT_WEBHOOK_SECRET
 elif BOT_TOKEN:
-    # Stable across Render restarts; avoids changing the webhook secret on each boot.
-    WEBHOOK_SECRET = hashlib.sha256(f"mf-movie-forwarder:{BOT_TOKEN}".encode()).hexdigest()
+    WEBHOOK_SECRET = hashlib.sha256(f"mf-movie-library:{BOT_TOKEN}".encode()).hexdigest()
 else:
     WEBHOOK_SECRET = ""
 
 FILE_BACKUP_CHANNEL_ID = os.getenv("FILE_BACKUP_CHANNEL_ID", "").strip()
+
+
 def configured_source_chat_refs(primary: str, backup: str = "") -> list[str]:
     refs = [item.strip() for item in primary.split(",") if item.strip()]
     if backup and backup not in refs:
@@ -82,32 +82,26 @@ FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 _ADMIN_VALUE = os.getenv("ADMIN_ID", "").strip()
 ADMIN_ID = int(_ADMIN_VALUE) if _ADMIN_VALUE.isdigit() else 0
-APPROVED_DESTINATION_IDS: set[int] = {
-    int(item.strip())
-    for item in os.getenv("APPROVED_DESTINATION_CHANNEL_IDS", "").split(",")
-    if re.fullmatch(r"-\d{1,19}", item.strip()) and int(item.strip()) < 0
-}
-LEGACY_DESTINATION_ID = os.getenv("DESTINATION_CHANNEL_ID", "").strip()
-AUTO_FORWARD_NEW = os.getenv("AUTO_FORWARD_NEW", "true").strip().lower() in {"1", "true", "yes", "on"}
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 DELETE_AFTER_SECONDS = 600
 MAX_SEARCH_RESULTS = 10
+REQUESTS_PER_PAGE = 20
 CACHE_SECONDS = 20
-FORWARD_INTERVAL_SECONDS = 3.0
+BROADCAST_DELAY_SECONDS = 0.05
 
 BOT_APP: Application | None = None
 FIREBASE_APP: firebase_admin.App | None = None
 SOURCE_CHANNEL_IDS: set[int] = set()
-APPROVED_DESTINATIONS: dict[int, str] = {}
-KNOWN_DESTINATIONS: dict[int, str] = {}
-PENDING_DESTINATIONS: dict[int, str] = {}
-PERSISTED_DESTINATION_IDS: set[int] = set()
 FILE_CATALOG_CACHE: dict[str, dict[str, Any]] = {}
 FILE_CATALOG_CACHE_AT = 0.0
 DELETE_TASKS: dict[str, asyncio.Task] = {}
-FORWARD_LOCK = asyncio.Lock()
-FORWARDED_IN_MEMORY: set[tuple[int, int, int]] = set()
-LAST_FORWARD_AT = 0.0
+SEARCH_SESSIONS: dict[str, dict[str, Any]] = {}
+MOVIE_REQUEST_SESSIONS: dict[str, dict[str, Any]] = {}
+PENDING_BROADCASTS: dict[str, dict[str, Any]] = {}
+USER_REGISTER_LOCK = asyncio.Lock()
+CATALOG_WRITE_LOCK = asyncio.Lock()
+STAT_RECONCILE_LOCK = asyncio.Lock()
+BROADCAST_TASKS: dict[str, asyncio.Task] = {}
 
 
 def chat_reference(value: str | int) -> int | str:
@@ -204,7 +198,11 @@ def initialize_firebase() -> firebase_admin.App | None:
         options: dict[str, Any] = {"databaseURL": FIREBASE_DATABASE_URL}
         if FIREBASE_PROJECT_ID:
             options["projectId"] = FIREBASE_PROJECT_ID
-        return firebase_admin.initialize_app(credential, options, name="mf-movie-search-bot")
+        app_name = "mf-movie-search-bot"
+        try:
+            return firebase_admin.get_app(app_name)
+        except ValueError:
+            return firebase_admin.initialize_app(credential, options, name=app_name)
     except Exception as exc:
         logger.error("Firebase initialization failed (%s); check server-side credentials and database URL", type(exc).__name__)
         return None
@@ -233,10 +231,34 @@ def media_caption(record: dict[str, Any]) -> str:
     return f"🎬 <code>{html.escape(name[:900])}</code>"
 
 
-def main_channel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("MF Main Channel", url="https://t.me/mfmainchannel")]]
-    )
+def keyboard_button(text: str, *, callback_data: str | None = None, url: str | None = None, style: str = "success") -> InlineKeyboardButton:
+    if callback_data is not None:
+        return InlineKeyboardButton(text, callback_data=callback_data, style=style)
+    return InlineKeyboardButton(text, url=url, style=style)
+
+
+def retry_delay(exc: RetryAfter) -> float:
+    value = exc.retry_after
+    return value.total_seconds() if hasattr(value, "total_seconds") else float(value)
+
+
+def upload_action_for_media(media_type: str) -> str:
+    return {
+        "photo": "upload_photo",
+        "video": "upload_video",
+        "audio": "upload_document",
+        "voice": "upload_voice",
+        "document": "upload_document",
+        "animation": "upload_video",
+        "video_note": "upload_video_note",
+    }.get(media_type, "upload_document")
+
+
+async def send_chat_action(bot, chat_id: int, action: str) -> None:
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action=action)
+    except TelegramError as exc:
+        logger.debug("Chat action could not be sent (%s)", type(exc).__name__)
 
 
 async def get_catalog(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
@@ -250,7 +272,7 @@ async def get_catalog(*, refresh: bool = False) -> dict[str, dict[str, Any]]:
     FILE_CATALOG_CACHE = {
         str(key): value for key, value in raw.items() if isinstance(value, dict)
     }
-    FILE_CATALOG_CACHE_AT = now
+    FILE_CATALOG_CACHE_AT = time.monotonic()
     return FILE_CATALOG_CACHE
 
 
@@ -268,235 +290,127 @@ async def get_catalog_entry(key: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-async def delete_catalog_entry(key: str) -> None:
-    await asyncio.to_thread(firebase_reference(f"files/{key}").delete)
-    FILE_CATALOG_CACHE.pop(key, None)
-
-
-async def is_already_forwarded(destination_id: int, source_key: str) -> bool:
-    if firebase_ready():
+async def increment_stat(path: str, amount: int = 1) -> int:
+    def increment(current):
         try:
-            value = await asyncio.to_thread(
-                firebase_reference(f"forwarded/{destination_id}/{source_key}").get
-            )
-            return bool(value)
-        except Exception as exc:
-            logger.warning("Could not check Firebase forwarding history (%s)", type(exc).__name__)
-    source_chat_id, source_message_id = (int(part) for part in source_key.split("_", 1))
-    return (destination_id, source_chat_id, source_message_id) in FORWARDED_IN_MEMORY
+            return int(current or 0) + amount
+        except (TypeError, ValueError):
+            return amount
+
+    value = await asyncio.to_thread(firebase_reference(path).transaction, increment)
+    return int(value or 0)
 
 
-async def remember_forward(destination_id: int, source_chat_id: int, message_id: int) -> None:
-    FORWARDED_IN_MEMORY.add((destination_id, source_chat_id, message_id))
-    if firebase_ready():
-        key = f"{source_chat_id}_{message_id}"
+async def ensure_total_files_count() -> int:
+    reference = firebase_reference("stats/total_files")
+    current = await asyncio.to_thread(reference.get)
+    if current is not None:
         try:
-            await asyncio.to_thread(
-                firebase_reference(f"forwarded/{destination_id}/{key}").set,
-                {"forwarded_at": datetime.now(timezone.utc).isoformat()},
-            )
-        except Exception as exc:
-            logger.warning("Could not persist one forwarding record (%s)", type(exc).__name__)
-
-
-async def forward_source_once(
-    destination_id: int,
-    source_chat_id: int,
-    message_id: int,
-    record: dict[str, Any],
-) -> None:
-    global LAST_FORWARD_AT
-    if not BOT_APP or destination_id not in APPROVED_DESTINATIONS:
-        return
-    key = f"{source_chat_id}_{message_id}"
-    async with FORWARD_LOCK:
-        if await is_already_forwarded(destination_id, key):
-            return
-        loop = asyncio.get_running_loop()
-        delay = FORWARD_INTERVAL_SECONDS - (loop.time() - LAST_FORWARD_AT)
-        if delay > 0:
-            await asyncio.sleep(delay)
-        sent = None
-        for attempt in range(3):
-            try:
-                sent = await BOT_APP.bot.forward_message(
-                    chat_id=destination_id,
-                    from_chat_id=source_chat_id,
-                    message_id=message_id,
-                )
-                LAST_FORWARD_AT = loop.time()
-                break
-            except RetryAfter as exc:
-                retry_after = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
-                await asyncio.sleep(max(retry_after + 0.5, FORWARD_INTERVAL_SECONDS))
-            except TelegramError as exc:
-                logger.warning("Forwarding one source post failed (%s)", type(exc).__name__)
-                return
-            except Exception as exc:
-                logger.warning("Forwarding one source post failed (%s)", type(exc).__name__)
-                return
-        if sent is None:
-            logger.warning("Forwarding retries were exhausted for one source post")
-            return
-
-        for edit_attempt in range(3):
-            try:
-                await BOT_APP.bot.edit_message_caption(
-                    chat_id=destination_id,
-                    message_id=sent.message_id,
-                    caption=media_caption(record),
-                    parse_mode="HTML",
-                    reply_markup=main_channel_keyboard(),
-                )
-                await remember_forward(destination_id, source_chat_id, message_id)
-                logger.info("Forwarded one new source post to an approved destination")
-                return
-            except RetryAfter as exc:
-                retry_after = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
-                await asyncio.sleep(max(retry_after + 0.5, FORWARD_INTERVAL_SECONDS))
-            except TelegramError as exc:
-                logger.warning("Could not add caption/button to a forwarded post (%s)", type(exc).__name__)
-                try:
-                    await BOT_APP.bot.delete_message(chat_id=destination_id, message_id=sent.message_id)
-                except TelegramError:
-                    # The forwarded post remains visible; record it to prevent a duplicate.
-                    await remember_forward(destination_id, source_chat_id, message_id)
-                return
-            except Exception as exc:
-                logger.warning("Could not add caption/button to a forwarded post (%s)", type(exc).__name__)
-                try:
-                    await BOT_APP.bot.delete_message(chat_id=destination_id, message_id=sent.message_id)
-                except Exception:
-                    await remember_forward(destination_id, source_chat_id, message_id)
-                return
-        try:
-            await BOT_APP.bot.delete_message(chat_id=destination_id, message_id=sent.message_id)
-        except TelegramError:
-            await remember_forward(destination_id, source_chat_id, message_id)
-        logger.warning("Caption/button update retries were exhausted for one forwarded post")
-
-
-async def forward_new_post(source_chat_id: int, message_id: int, record: dict[str, Any]) -> None:
-    if not AUTO_FORWARD_NEW:
-        return
-    for destination_id in list(APPROVED_DESTINATIONS):
-        await forward_source_once(destination_id, source_chat_id, message_id, record)
-
-
-async def notify_admin(text: str) -> None:
-    if not BOT_APP or not ADMIN_ID:
-        return
-    try:
-        await BOT_APP.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
-    except TelegramError as exc:
-        logger.warning("Could not send an admin notice (%s)", type(exc).__name__)
-
-
-async def prompt_destination(destination_id: int, title: str, *, force: bool = False) -> None:
-    if not BOT_APP or not ADMIN_ID:
-        return
-    if destination_id in APPROVED_DESTINATIONS and not force:
-        return
-    if destination_id in PENDING_DESTINATIONS and not force:
-        return
-    KNOWN_DESTINATIONS[destination_id] = title
-    PENDING_DESTINATIONS[destination_id] = title
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Approve future forwards", callback_data=f"destination:yes:{destination_id}")],
-            [InlineKeyboardButton("✖️ Decline", callback_data=f"destination:no:{destination_id}")],
-        ]
+            return int(current)
+        except (TypeError, ValueError):
+            pass
+    catalog = await get_catalog(refresh=True)
+    count = len(catalog)
+    value = await asyncio.to_thread(
+        reference.transaction,
+        lambda existing: int(existing) if existing is not None else count,
     )
-    try:
-        await BOT_APP.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                "<b>DESTINATION APPROVAL</b>\n\n"
-                f"The bot was made an administrator in <b>{html.escape(title)}</b>. "
-                "Would you like to forward new media from your configured archive to this channel?\n\n"
-                "<i>This bot indexes and forwards new posts only; earlier archive history is not imported automatically.</i>"
-            ),
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-    except TelegramError as exc:
-        logger.warning("Could not send destination approval prompt (%s)", type(exc).__name__)
+    return int(value or 0)
 
 
-async def destination_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.message:
-        return
-    if not ADMIN_ID or query.from_user.id != ADMIN_ID:
-        await query.answer("Admin only.", show_alert=True)
-        return
-    try:
-        _, action, raw_id = (query.data or "").split(":", 2)
-        destination_id = int(raw_id)
-    except (ValueError, TypeError):
-        await query.answer("Invalid approval action.", show_alert=True)
-        return
-    title = PENDING_DESTINATIONS.get(destination_id) or KNOWN_DESTINATIONS.get(destination_id)
-    if not title or action not in {"yes", "no"}:
-        await query.answer("This approval is no longer available.", show_alert=True)
-        return
-    PENDING_DESTINATIONS.pop(destination_id, None)
-    if action == "no":
-        await query.answer("Cancelled; nothing was approved.")
-        await query.edit_message_text(
-            f"<b>APPROVAL DECLINED</b>\n\nNo future posts will be forwarded to <b>{html.escape(title)}</b>.",
-            parse_mode="HTML",
-        )
-        return
-    APPROVED_DESTINATIONS[destination_id] = title
-    await query.answer("Destination approved")
-    await query.edit_message_text(
-        f"<b>DESTINATION APPROVED</b>\n\nFuture eligible source posts will be forwarded to <b>{html.escape(title)}</b>. "
-        "Older archive history is not imported automatically.",
-        parse_mode="HTML",
+async def ensure_total_users_count() -> int:
+    reference = firebase_reference("stats/total_users")
+    current = await asyncio.to_thread(reference.get)
+    if current is not None:
+        try:
+            return int(current)
+        except (TypeError, ValueError):
+            pass
+    users = await asyncio.to_thread(firebase_reference("users").get)
+    count = len(users) if isinstance(users, dict) else 0
+    value = await asyncio.to_thread(
+        reference.transaction,
+        lambda existing: int(existing) if existing is not None else count,
     )
-    if destination_id not in PERSISTED_DESTINATION_IDS:
-        await notify_admin(
-            f"To keep <b>{html.escape(title)}</b> (ID <code>{destination_id}</code>) approved after a Render restart, "
-            "add this ID to <code>APPROVED_DESTINATION_CHANNEL_IDS</code> in Render Environment, preserving existing IDs."
-        )
+    return int(value or 0)
 
 
-async def publish_new_destination(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    change = update.my_chat_member
-    chat = update.effective_chat
-    if not change or not chat or chat.type != "channel":
+async def register_user(user) -> None:
+    if not firebase_ready() or not user:
         return
-    if not ADMIN_ID or change.from_user.id != ADMIN_ID:
-        return
-    if change.new_chat_member.status not in {"administrator", "creator"}:
-        return
-    if chat.id in SOURCE_CHANNEL_IDS:
-        return
-    title = chat.title or (f"@{chat.username}" if chat.username else str(chat.id))
-    KNOWN_DESTINATIONS[int(chat.id)] = title
-    await prompt_destination(int(chat.id), title)
+    user_id = int(user.id)
+    now = datetime.now(timezone.utc).isoformat()
+    async with USER_REGISTER_LOCK:
+        reference = firebase_reference(f"users/{user_id}")
+        existing = await asyncio.to_thread(reference.get)
+        record = {
+            "user_id": user_id,
+            "chat_id": user_id,
+            "first_seen_at": (existing or {}).get("first_seen_at", now) if isinstance(existing, dict) else now,
+            "last_seen_at": now,
+        }
+        await asyncio.to_thread(reference.set, record)
+        if not isinstance(existing, dict):
+            current = await asyncio.to_thread(firebase_reference("stats/total_users").get)
+            if current is None:
+                await ensure_total_users_count()
+            else:
+                await increment_stat("stats/total_users")
 
 
-async def register_configured_destinations(application: Application) -> None:
-    for destination_id in sorted(APPROVED_DESTINATION_IDS):
+async def record_search(query: str) -> None:
+    normalized = normalize_search_text(query)
+    if not normalized:
+        return
+    search_key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    reference = firebase_reference(f"stats/top_searches/{search_key}")
+    display_query = " ".join(query.split())[:120]
+    now = datetime.now(timezone.utc).isoformat()
+
+    def update_search(current):
+        record = current if isinstance(current, dict) else {}
         try:
-            chat = await application.bot.get_chat(destination_id)
-            title = str(chat.title or chat.username or destination_id)
-            APPROVED_DESTINATIONS[destination_id] = title
-            KNOWN_DESTINATIONS[destination_id] = title
-            PERSISTED_DESTINATION_IDS.add(destination_id)
-        except TelegramError as exc:
-            logger.warning("Could not resolve one configured approved destination (%s)", type(exc).__name__)
-    if LEGACY_DESTINATION_ID:
-        try:
-            chat = await application.bot.get_chat(chat_reference(LEGACY_DESTINATION_ID))
-            destination_id = int(chat.id)
-            if destination_id not in SOURCE_CHANNEL_IDS:
-                KNOWN_DESTINATIONS[destination_id] = str(chat.title or chat.username or destination_id)
-                await prompt_destination(destination_id, KNOWN_DESTINATIONS[destination_id])
-        except TelegramError as exc:
-            logger.warning("Could not resolve one legacy destination (%s)", type(exc).__name__)
+            count = int(record.get("count", 0))
+        except (TypeError, ValueError):
+            count = 0
+        return {
+            "query": display_query,
+            "normalized_query": normalized[:160],
+            "count": count + 1,
+            "last_searched_at": now,
+        }
+
+    await asyncio.to_thread(reference.transaction, update_search)
+    await increment_stat("stats/total_searches")
+
+
+async def get_status_stats() -> dict[str, Any]:
+    async with STAT_RECONCILE_LOCK:
+        catalog = await get_catalog(refresh=True)
+        users = await asyncio.to_thread(firebase_reference("users").get)
+        raw = await asyncio.to_thread(firebase_reference("stats").get)
+        stats = raw if isinstance(raw, dict) else {}
+        searches = stats.get("top_searches", {})
+        top = [value for value in searches.values() if isinstance(value, dict)] if isinstance(searches, dict) else []
+
+        def search_count(record: dict[str, Any]) -> int:
+            try:
+                return max(0, int(record.get("count", 0) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        top.sort(key=search_count, reverse=True)
+        totals = {
+            "total_users": len(users) if isinstance(users, dict) else 0,
+            "total_files": len(catalog),
+            "total_searches": sum(search_count(record) for record in top),
+        }
+        for name, value in totals.items():
+            await asyncio.to_thread(firebase_reference(f"stats/{name}").set, value)
+    return {
+        **totals,
+        "top_searches": top[:5],
+    }
 
 
 async def search_catalog(query: str) -> list[tuple[str, dict[str, Any]]]:
@@ -510,7 +424,73 @@ async def search_catalog(query: str) -> list[tuple[str, dict[str, Any]]]:
         if all(term in str(record.get("search_text", "")) for term in terms)
     ]
     found.sort(key=lambda item: str(item[1].get("indexed_at", "")), reverse=True)
-    return found[:MAX_SEARCH_RESULTS]
+    return found
+
+
+def new_session_token(user_id: int, value: str) -> str:
+    seed = f"{user_id}:{value}:{time.time_ns()}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:14]
+
+
+def make_movie_request_session(user_id: int, title: str) -> str:
+    token = new_session_token(user_id, title)
+    MOVIE_REQUEST_SESSIONS[token] = {
+        "user_id": user_id,
+        "title": title[:180],
+        "created_at": time.time(),
+    }
+    return token
+
+
+def make_search_session(user_id: int, title: str) -> str:
+    token = new_session_token(user_id, title)
+    SEARCH_SESSIONS[token] = {
+        "user_id": user_id,
+        "query": title[:180],
+        "created_at": time.time(),
+    }
+    if len(SEARCH_SESSIONS) > 1000:
+        oldest = sorted(SEARCH_SESSIONS, key=lambda key: SEARCH_SESSIONS[key]["created_at"])
+        for expired in oldest[: len(SEARCH_SESSIONS) - 800]:
+            SEARCH_SESSIONS.pop(expired, None)
+    return token
+
+
+def search_page_keyboard(
+    matches: list[tuple[str, dict[str, Any]]], token: str, offset: int
+) -> InlineKeyboardMarkup:
+    rows = [
+        [keyboard_button(result_button_text(record), callback_data=f"file:{key}", style="primary")]
+        for key, record in matches[offset : offset + MAX_SEARCH_RESULTS]
+    ]
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(keyboard_button("‹ Back", callback_data=f"page:{token}:{max(0, offset - MAX_SEARCH_RESULTS)}"))
+    if offset + MAX_SEARCH_RESULTS < len(matches):
+        nav.append(keyboard_button("Next ›", callback_data=f"page:{token}:{offset + MAX_SEARCH_RESULTS}"))
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+def search_page_text(query: str, total: int, offset: int) -> str:
+    first = offset + 1 if total else 0
+    last = min(offset + MAX_SEARCH_RESULTS, total)
+    page = offset // MAX_SEARCH_RESULTS + 1
+    pages = max(1, (total + MAX_SEARCH_RESULTS - 1) // MAX_SEARCH_RESULTS)
+    return (
+        f"<b>YOUR RESULTS</b> · {first}–{last} of {total} file(s)\n"
+        f"<i>Page {page} of {pages}</i>\n\n"
+        f"Choose a file matching <code>{html.escape(query[:100])}</code>. "
+        "Each button shows the file name and size."
+    )
+
+
+def no_results_keyboard(user_id: int, title: str) -> InlineKeyboardMarkup:
+    token = make_movie_request_session(user_id, title)
+    return InlineKeyboardMarkup(
+        [[keyboard_button("Request this movie", callback_data=f"movie_request:{token}")]]
+    )
 
 
 async def is_user_member(bot, user_id: int) -> bool:
@@ -539,7 +519,7 @@ async def force_join_keyboard(bot) -> InlineKeyboardMarkup | None:
             pass
     if not url:
         return None
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Join channel to unlock", url=url)]])
+    return InlineKeyboardMarkup([[keyboard_button("Join channel to unlock", url=url)]])
 
 
 async def send_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -559,19 +539,21 @@ async def send_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
+    user = update.effective_user
     if not message:
         return
+    if user and message.chat.type == "private":
+        await register_user(user)
     await message.reply_text(
         "<b>MF MOVIE LIBRARY</b>\n"
         "<i>Your archive, beautifully within reach.</i>\n\n"
         "<b>Search</b>\n"
-        "Send a movie title or filename as a regular message. Choose a matching result to receive your file.\n\n"
+        "Send a movie title or filename as a regular message. Browse results with Next and Back, then choose a file.\n\n"
+        "<b>Can't find it?</b>\n"
+        "Request a movie from the results message and the admin will review it.\n\n"
         "<b>Fast delivery</b>\n"
         "Files are copied directly from the authorized Telegram archive and automatically removed from this chat "
-        "after <b>10 minutes</b>.\n\n"
-        "<b>New releases</b>\n"
-        "New source-channel media is indexed automatically and forwarded to individually approved destination channels.\n\n"
-        "<i>Only newly posted media is indexed. Previous channel history is not imported automatically.</i>",
+        "after <b>10 minutes</b>.",
         parse_mode="HTML",
     )
 
@@ -587,6 +569,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
             parse_mode="HTML",
         )
         return
+    await send_chat_action(context.bot, user.id, "typing")
+    await register_user(user)
     if not FORCE_JOIN_CHANNEL_ID:
         await message.reply_text(
             "<b>CATALOG TEMPORARILY UNAVAILABLE</b>\n\nThe membership channel has not been configured yet. Please try again later.",
@@ -610,6 +594,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
         )
         return
     try:
+        await record_search(query_text)
         matches = await search_catalog(query_text)
     except Exception as exc:
         logger.error("Firebase search failed (%s)", type(exc).__name__)
@@ -621,31 +606,43 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
     if not matches:
         await message.reply_text(
             f"<b>NO MATCHES FOUND</b>\n\nWe couldn't find a file matching <code>{html.escape(query_text[:100])}</code>. "
-            "Try a shorter title or another spelling.",
+            "Try a shorter title or another spelling. You can also send a request to the admin.",
             parse_mode="HTML",
+            reply_markup=no_results_keyboard(user.id, query_text),
         )
         return
-    rows = [
-        [InlineKeyboardButton(result_button_text(record), callback_data=f"file:{key}")]
-        for key, record in matches
-    ]
+    token = make_search_session(user.id, query_text)
     await message.reply_text(
-        f"<b>YOUR RESULTS</b> · {len(matches)} MATCHING FILE(S)\n\n"
-        "Choose a file below. Each button shows the file name and size.",
+        search_page_text(query_text, len(matches), 0),
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(rows),
+        reply_markup=search_page_keyboard(matches, token, 0),
     )
 
 
-async def index_channel_post(update: Update) -> None:
+async def save_new_media_post(message, record: dict[str, Any]) -> None:
     global FILE_CATALOG_CACHE_AT
+    key = f"{message.chat.id}_{message.message_id}"
+    async with CATALOG_WRITE_LOCK:
+        entry_ref = firebase_reference(f"files/{key}")
+        existing = await asyncio.to_thread(entry_ref.get)
+        total_ref = firebase_reference("stats/total_files")
+        current_total = await asyncio.to_thread(total_ref.get) if existing is None else None
+        await save_catalog_entry(key, record)
+        if existing is None:
+            if current_total is None:
+                await ensure_total_files_count()
+            else:
+                await increment_stat("stats/total_files")
+    FILE_CATALOG_CACHE_AT = time.monotonic()
+
+
+async def index_channel_post(update: Update) -> None:
     message = update.channel_post
     if not message or message.chat.id not in SOURCE_CHANNEL_IDS:
         return
     details = extract_media_details(message)
     if not details:
         return
-    key = f"{message.chat.id}_{message.message_id}"
     record = {
         **details,
         "source_chat_id": int(message.chat.id),
@@ -654,16 +651,14 @@ async def index_channel_post(update: Update) -> None:
         "source_url": message_link(message.chat, message.message_id),
         "indexed_at": datetime.now(timezone.utc).isoformat(),
     }
-    if firebase_ready():
-        try:
-            await save_catalog_entry(key, record)
-            logger.info("Indexed one new media post")
-        except Exception as exc:
-            FILE_CATALOG_CACHE_AT = 0.0
-            logger.error("Firebase write failed for one source post (%s)", type(exc).__name__)
-    else:
+    if not firebase_ready():
         logger.warning("A source media post arrived, but Firebase is not configured")
-    await forward_new_post(int(message.chat.id), int(message.message_id), record)
+        return
+    try:
+        await save_new_media_post(message, record)
+        logger.info("Indexed one new media post")
+    except Exception as exc:
+        logger.error("Firebase write failed for one source post (%s)", type(exc).__name__)
 
 
 async def persist_pending_delete(key: str, record: dict[str, int]) -> bool:
@@ -698,8 +693,7 @@ async def delete_delivered_file(key: str, chat_id: int, message_id: int, delete_
                 await clear_pending_delete(key)
                 return
             except RetryAfter as exc:
-                delay = exc.retry_after.total_seconds() if hasattr(exc.retry_after, "total_seconds") else float(exc.retry_after)
-                await asyncio.sleep(max(delay + 1, 1))
+                await asyncio.sleep(max(retry_delay(exc) + 1, 1))
             except TelegramError as exc:
                 logger.warning("Scheduled file deletion failed (%s)", type(exc).__name__)
                 if attempt == 2:
@@ -750,6 +744,7 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if query.message.chat.type != "private":
         await query.answer("Open a private chat with MF Movie Library to receive files.", show_alert=True)
         return
+    await register_user(query.from_user)
     key = (query.data or "").removeprefix("file:")
     if not re.fullmatch(r"-?\d{1,19}_\d{1,20}", key):
         await query.answer("That file selection is invalid. Please search again.", show_alert=True)
@@ -774,16 +769,27 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not firebase_ready():
         await query.answer("The catalog is not ready yet. Please try again shortly.", show_alert=True)
         return
+    await query.answer("Sending your file…")
+    await send_chat_action(context.bot, query.from_user.id, "typing")
     try:
         record = await get_catalog_entry(key)
     except Exception as exc:
         logger.error("Firebase file lookup failed (%s)", type(exc).__name__)
-        await query.answer("Search is temporarily unavailable. Please try again shortly.", show_alert=True)
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="<b>DELIVERY TEMPORARILY UNAVAILABLE</b>\n\nPlease try again shortly.",
+            parse_mode="HTML",
+        )
         return
     if not record:
-        await query.answer("This file is no longer available in the catalog. Please search again.", show_alert=True)
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="<b>FILE NO LONGER AVAILABLE</b>\n\nPlease search again for an updated result.",
+            parse_mode="HTML",
+        )
         return
-    await query.answer("Sending the selected file…")
+    action = upload_action_for_media(str(record.get("media_type", "document")))
+    await send_chat_action(context.bot, query.from_user.id, action)
     try:
         copied = await context.bot.copy_message(
             chat_id=query.from_user.id,
@@ -808,75 +814,704 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     }
     await persist_pending_delete(deletion_key, deletion_record)
     schedule_file_deletion(deletion_key, query.from_user.id, copied.message_id, delete_at)
+    await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text=(
+            f"<b>DELIVERY COMPLETE</b>\n\n"
+            f"<code>{html.escape(str(record.get('file_name', 'File'))[:180])}</code> is ready. "
+            "This copy will be automatically removed from this chat in <b>10 minutes</b>."
+        ),
+        parse_mode="HTML",
+    )
+
+
+async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user or not query.message:
+        return
+    if query.message.chat.type != "private":
+        await query.answer("Requests are available in your private chat with the bot.", show_alert=True)
+        return
+    await register_user(query.from_user)
+    token = (query.data or "").removeprefix("movie_request:")
+    request_session = MOVIE_REQUEST_SESSIONS.get(token)
+    if not request_session or request_session.get("user_id") != query.from_user.id:
+        await query.answer("This request button has expired. Please search again.", show_alert=True)
+        return
+    if not FORCE_JOIN_CHANNEL_ID or not await is_user_member(context.bot, query.from_user.id):
+        await query.answer("Join our required channel before sending a request.", show_alert=True)
+        keyboard = await force_join_keyboard(context.bot)
+        if keyboard:
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="<b>MEMBERSHIP REQUIRED</b>\n\nJoin the channel, then send your movie request.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        return
+    if not firebase_ready():
+        await query.answer("Requests are temporarily unavailable. Please try again later.", show_alert=True)
+        return
+    title = str(request_session["title"])
+    normalized = normalize_search_text(title)
+    request_key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+    reference = firebase_reference(f"movie_requests/{request_key}")
+    before = await asyncio.to_thread(reference.get)
+    user_key = str(query.from_user.id)
+    now = datetime.now(timezone.utc).isoformat()
+    requester = {
+        "user_id": query.from_user.id,
+        "requested_at": now,
+    }
+
+    def merge_request(current):
+        record = current if isinstance(current, dict) else {}
+        requesters = record.get("requesters") if isinstance(record.get("requesters"), dict) else {}
+        requesters = dict(requesters)
+        requesters[user_key] = requester
+        status = record.get("status", "pending")
+        if status != "pending":
+            status = "pending"
+        return {
+            **record,
+            "title": str(record.get("title") or title)[:180],
+            "normalized_title": normalized[:180],
+            "status": status,
+            "created_at": record.get("created_at", now),
+            "updated_at": now,
+            "requesters": requesters,
+            "requester_count": len(requesters),
+        }
+
     try:
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text=(
-                f"<b>DELIVERY COMPLETE</b>\n\n"
-                f"<code>{html.escape(str(record.get('file_name', 'File'))[:180])}</code> is ready. "
-                "This copy will be automatically removed from this chat in <b>10 minutes</b>."
-            ),
+        request_record = await asyncio.to_thread(reference.transaction, merge_request)
+    except Exception as exc:
+        logger.error("Firebase movie request write failed (%s)", type(exc).__name__)
+        await query.answer("Your request could not be saved. Please try again.", show_alert=True)
+        return
+    MOVIE_REQUEST_SESSIONS.pop(token, None)
+    await query.answer("Request sent to the admin.")
+    await query.edit_message_text(
+        f"<b>REQUEST RECEIVED</b>\n\n"
+        f"Your request for <code>{html.escape(title[:180])}</code> has been sent to the admin. "
+        "If it is added, you will receive a message here.",
+        parse_mode="HTML",
+    )
+    existed_pending = isinstance(before, dict) and before.get("status") == "pending"
+    existing_requesters = before.get("requesters", {}) if isinstance(before, dict) else {}
+    new_requester = user_key not in existing_requesters
+    if ADMIN_ID and (not existed_pending or new_requester):
+        current_count = int((request_record or {}).get("requester_count", 1) or 1)
+        await notify_admin(
+            "<b>NEW MOVIE REQUEST</b>\n\n"
+            f"Title: <code>{html.escape(title[:180])}</code>\n"
+            f"Requesters: <b>{current_count}</b>\n\n"
+            "Open <code>/requests</code> to review it."
+        )
+
+
+async def get_pending_requests() -> list[tuple[str, dict[str, Any]]]:
+    raw = await asyncio.to_thread(firebase_reference("movie_requests").get)
+    if not isinstance(raw, dict):
+        return []
+    requests = [
+        (str(key), value)
+        for key, value in raw.items()
+        if isinstance(value, dict) and value.get("status", "pending") == "pending"
+    ]
+    requests.sort(key=lambda item: str(item[1].get("created_at", "")))
+    return requests
+
+
+def requests_page_content(
+    pending: list[tuple[str, dict[str, Any]]], offset: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    total = len(pending)
+    if not total:
+        return (
+            "<b>MOVIE REQUESTS</b>\n\nThere are no open requests right now.",
+            None,
+        )
+    page_items = pending[offset : offset + REQUESTS_PER_PAGE]
+    lines = [
+        f"<b>MOVIE REQUESTS</b> · {total} open\n<i>Page {offset // REQUESTS_PER_PAGE + 1} of {(total + REQUESTS_PER_PAGE - 1) // REQUESTS_PER_PAGE}</i>\n"
+    ]
+    rows = []
+    for request_key, record in page_items:
+        title = str(record.get("title", "Untitled movie"))[:160]
+        count = int(record.get("requester_count", len(record.get("requesters", {})) or 0) or 0)
+        lines.append(f"\n• <code>{html.escape(title)}</code> · {count} requester(s)")
+        rows.append([
+            keyboard_button(
+                f"Mark added · {title[:38]}",
+                callback_data=f"request_done:{request_key}:{offset}",
+            )
+        ])
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        nav.append(keyboard_button("‹ Back", callback_data=f"request_page:{max(0, offset - REQUESTS_PER_PAGE)}"))
+    if offset + REQUESTS_PER_PAGE < total:
+        nav.append(keyboard_button("Next ›", callback_data=f"request_page:{offset + REQUESTS_PER_PAGE}"))
+    if nav:
+        rows.append(nav)
+    return "".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def show_requests(update: Update, context: ContextTypes.DEFAULT_TYPE, offset: int = 0, *, edit: bool = False) -> None:
+    message = update.effective_message
+    query = update.callback_query
+    chat_id = (query.message.chat_id if query and query.message else message.chat_id if message else None)
+    if not chat_id or not firebase_ready():
+        if message:
+            await message.reply_text(
+                "<b>REQUESTS UNAVAILABLE</b>\n\nFirebase must be connected before movie requests can be listed.",
+                parse_mode="HTML",
+            )
+        return
+    try:
+        pending = await get_pending_requests()
+        offset = max(0, min(offset, ((len(pending) - 1) // REQUESTS_PER_PAGE) * REQUESTS_PER_PAGE if pending else 0))
+        text, keyboard = requests_page_content(pending, offset)
+    except Exception as exc:
+        logger.error("Firebase requests read failed (%s)", type(exc).__name__)
+        if message:
+            await message.reply_text("<b>REQUESTS TEMPORARILY UNAVAILABLE</b>", parse_mode="HTML")
+        return
+    if edit and query and query.message:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    elif message:
+        await message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def request_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    if not ADMIN_ID or query.from_user.id != ADMIN_ID:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    try:
+        offset = int((query.data or "").split(":", 1)[1])
+    except (IndexError, ValueError):
+        await query.answer("Invalid page.", show_alert=True)
+        return
+    await query.answer()
+    await show_requests(update, context, offset, edit=True)
+
+
+async def complete_movie_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    if not ADMIN_ID or query.from_user.id != ADMIN_ID:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    try:
+        _, request_key, raw_offset = (query.data or "").split(":", 2)
+        offset = int(raw_offset)
+    except (ValueError, TypeError):
+        await query.answer("This request button is invalid.", show_alert=True)
+        return
+    try:
+        reference = firebase_reference(f"movie_requests/{request_key}")
+        request_record = await asyncio.to_thread(reference.get)
+        if not isinstance(request_record, dict) or request_record.get("status") != "pending":
+            await query.answer("This request is already completed or unavailable.", show_alert=True)
+            await show_requests(update, context, offset, edit=True)
+            return
+        requesters = request_record.get("requesters", {})
+        now = datetime.now(timezone.utc).isoformat()
+
+        def complete_if_pending(current):
+            if not isinstance(current, dict) or current.get("status") != "pending":
+                return current
+            return {**current, "status": "added", "fulfilled_at": now, "fulfilled_by": ADMIN_ID}
+
+        updated = await asyncio.to_thread(reference.transaction, complete_if_pending)
+        if not isinstance(updated, dict) or updated.get("fulfilled_at") != now:
+            await query.answer("This request was already completed.", show_alert=True)
+            await show_requests(update, context, offset, edit=True)
+            return
+    except Exception as exc:
+        logger.error("Firebase movie request update failed (%s)", type(exc).__name__)
+        await query.answer("Could not update this request. Please try again.", show_alert=True)
+        return
+    await query.answer("Request marked as added.")
+    title = str(request_record.get("title", "your requested movie"))[:180]
+    requester_ids = []
+    if isinstance(requesters, dict):
+        for key, value in requesters.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                requester_id = int(value.get("user_id", key))
+            except (TypeError, ValueError):
+                continue
+            if requester_id > 0:
+                requester_ids.append(requester_id)
+    for user_id in requester_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "<b>YOUR REQUESTED MOVIE HAS BEEN ADDED</b>\n\n"
+                    f"<code>{html.escape(title)}</code> is now in the library. Send the title again to search for it."
+                ),
+                parse_mode="HTML",
+            )
+        except (TelegramError, ValueError) as exc:
+            logger.warning("Could not notify one movie requester (%s)", type(exc).__name__)
+    await show_requests(update, context, offset, edit=True)
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message:
+        return
+    await send_chat_action(context.bot, message.chat_id, "typing")
+    if not firebase_ready():
+        await message.reply_text(
+            "<b>MF MOVIE LIBRARY · LIVE STATUS</b>\n\n"
+            "Realtime Database: <b>Not ready</b>\n"
+            f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
+            f"Membership gate: <b>{'Enabled' if FORCE_JOIN_CHANNEL_ID else 'Not configured'}</b>",
             parse_mode="HTML",
         )
+        return
+    try:
+        stats = await get_status_stats()
+    except Exception as exc:
+        logger.error("Firebase dashboard stats read failed (%s)", type(exc).__name__)
+        await message.reply_text(
+            "<b>MF MOVIE LIBRARY · LIVE STATUS</b>\n\nRealtime Database: <b>Temporarily unavailable</b>",
+            parse_mode="HTML",
+        )
+        return
+    top = stats["top_searches"]
+    top_text = "\n".join(
+        f"{index}. {html.escape(str(item.get('query', 'Unknown'))[:80])} · <b>{int(item.get('count', 0) or 0)}</b>"
+        for index, item in enumerate(top, 1)
+    ) or "No searches recorded yet."
+    await message.reply_text(
+        "<b>MF MOVIE LIBRARY · LIVE STATUS</b>\n\n"
+        "<b>Realtime Database</b> · Connected\n"
+        f"Users: <b>{stats['total_users']:,}</b>\n"
+        f"Total files: <b>{stats['total_files']:,}</b>\n"
+        f"Total searches: <b>{stats['total_searches']:,}</b>\n"
+        f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
+        f"Membership gate: <b>{'Enabled' if FORCE_JOIN_CHANNEL_ID else 'Not configured'}</b>\n"
+        f"Automatic file deletion: <b>{DELETE_AFTER_SECONDS // 60} minutes</b>\n\n"
+        f"<b>TOP SEARCHES</b>\n{top_text}",
+        parse_mode="HTML",
+    )
+
+
+async def notify_admin(text: str) -> None:
+    if not BOT_APP or not ADMIN_ID:
+        return
+    try:
+        await BOT_APP.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
     except TelegramError as exc:
-        logger.warning("Could not send file-expiry notice (%s)", type(exc).__name__)
+        logger.warning("Could not send an admin notice (%s)", type(exc).__name__)
+
+
+def registered_chat_ids(users: Any) -> list[int]:
+    if not isinstance(users, dict):
+        return []
+    chat_ids: set[int] = set()
+    for key, value in users.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            chat_id = int(value.get("chat_id", value.get("user_id", key)))
+        except (ValueError, TypeError):
+            continue
+        if chat_id != ADMIN_ID:
+            chat_ids.add(chat_id)
+    return sorted(chat_ids)
+
+
+async def run_broadcast_job(token: str) -> None:
+    if not BOT_APP or not firebase_ready():
+        return
+    reference = firebase_reference(f"broadcast_jobs/{token}")
+    try:
+        job = await asyncio.to_thread(reference.get)
+    except Exception as exc:
+        logger.error("Firebase broadcast job read failed (%s)", type(exc).__name__)
+        return
+    if not isinstance(job, dict) or job.get("status") != "running":
+        return
+    raw_recipients = job.get("recipient_ids", {})
+    raw_sent = job.get("sent_to", {})
+    raw_failed = job.get("failed_to", {})
+    recipients = raw_recipients if isinstance(raw_recipients, dict) else {}
+    sent_to = dict(raw_sent) if isinstance(raw_sent, dict) else {}
+    failed_to = dict(raw_failed) if isinstance(raw_failed, dict) else {}
+    payload = job.get("payload")
+    if not isinstance(payload, dict):
+        logger.error("Broadcast job payload is invalid")
+        return
+
+    for raw_chat_id in recipients:
+        try:
+            chat_id = int(raw_chat_id)
+        except (TypeError, ValueError):
+            continue
+        recipient_key = str(chat_id)
+        if recipient_key in sent_to or recipient_key in failed_to:
+            continue
+        delivered = False
+        failure_reason = "DeliveryError"
+        for attempt in range(3):
+            try:
+                if payload.get("kind") == "text":
+                    await BOT_APP.bot.send_message(chat_id=chat_id, text=str(payload["text"]))
+                elif payload.get("kind") == "copy":
+                    await BOT_APP.bot.copy_message(
+                        chat_id=chat_id,
+                        from_chat_id=int(payload["from_chat_id"]),
+                        message_id=int(payload["message_id"]),
+                    )
+                else:
+                    failure_reason = "InvalidPayload"
+                    break
+                delivered = True
+                break
+            except RetryAfter as exc:
+                failure_reason = type(exc).__name__
+                if attempt < 2:
+                    await asyncio.sleep(max(retry_delay(exc) + 0.5, 1))
+            except TelegramError as exc:
+                failure_reason = type(exc).__name__
+                logger.info("Broadcast delivery failed for one user (%s)", failure_reason)
+                break
+            except Exception as exc:
+                failure_reason = type(exc).__name__
+                logger.warning("Broadcast delivery failed for one user (%s)", failure_reason)
+                break
+        try:
+            if delivered:
+                await asyncio.to_thread(firebase_reference(f"broadcast_jobs/{token}/sent_to/{recipient_key}").set, True)
+                sent_to[recipient_key] = True
+            else:
+                await asyncio.to_thread(
+                    firebase_reference(f"broadcast_jobs/{token}/failed_to/{recipient_key}").set,
+                    failure_reason,
+                )
+                failed_to[recipient_key] = failure_reason
+        except Exception as exc:
+            logger.error("Firebase broadcast progress write failed (%s)", type(exc).__name__)
+            return
+        await asyncio.sleep(BROADCAST_DELAY_SECONDS)
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    try:
+        await asyncio.to_thread(
+            reference.update,
+            {
+                "status": "completed",
+                "sent_count": len(sent_to),
+                "failed_count": len(failed_to),
+                "finished_at": finished_at,
+            },
+        )
+    except Exception as exc:
+        logger.error("Firebase broadcast completion write failed (%s)", type(exc).__name__)
+        return
+
+    summary = (
+        "<b>BROADCAST COMPLETE</b>\n\n"
+        f"Delivered: <b>{len(sent_to):,}</b>\n"
+        f"Could not deliver: <b>{len(failed_to):,}</b>"
+    )
+    try:
+        await BOT_APP.bot.edit_message_text(
+            chat_id=int(job.get("admin_id", ADMIN_ID)),
+            message_id=int(job["admin_message_id"]),
+            text=summary,
+            parse_mode="HTML",
+        )
+    except (TelegramError, KeyError, TypeError, ValueError):
+        try:
+            await notify_admin(summary)
+        except Exception:
+            logger.warning("Could not send broadcast completion summary")
+
+
+def start_background_broadcast(token: str, application: Application | None = None) -> bool:
+    target = application or BOT_APP
+    if not target:
+        return False
+    current = BROADCAST_TASKS.get(token)
+    if current and not current.done():
+        return True
+    try:
+        BROADCAST_TASKS[token] = target.create_task(run_broadcast_job(token))
+        return True
+    except Exception as exc:
+        logger.error("Could not schedule broadcast worker (%s)", type(exc).__name__)
+        return False
+
+
+async def resume_broadcast_jobs() -> None:
+    if not firebase_ready() or not BOT_APP:
+        return
+    try:
+        jobs = await asyncio.to_thread(firebase_reference("broadcast_jobs").get)
+    except Exception as exc:
+        logger.warning("Could not restore pending broadcasts (%s)", type(exc).__name__)
+        return
+    if not isinstance(jobs, dict):
+        return
+    for token, job in jobs.items():
+        if isinstance(job, dict) and job.get("status") == "running":
+            start_background_broadcast(str(token), BOT_APP)
+
+
+async def prepare_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, argument: str) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if message.chat.type != "private":
+        await message.reply_text("<b>PRIVATE ADMIN ACTION</b>\n\nRun /broadcast in the private bot chat.", parse_mode="HTML")
+        return
+    text = argument.strip()
+    replied = message.reply_to_message
+    if text:
+        if len(text.encode("utf-16-le")) // 2 > 3200:
+            await message.reply_text("<b>BROADCAST TOO LONG</b>\n\nPlease keep broadcast text to 3,200 characters or fewer.", parse_mode="HTML")
+            return
+        payload = {"kind": "text", "text": text}
+        description = f"Text message:\n\n{text}"
+    elif replied:
+        payload = {
+            "kind": "copy",
+            "from_chat_id": int(replied.chat_id),
+            "message_id": int(replied.message_id),
+        }
+        media_label = "photo/image" if replied.photo else "media or replied-to message"
+        description = f"The {media_label} you replied to will be copied to all registered users."
+    else:
+        await message.reply_text(
+            "<b>PREPARE A BROADCAST</b>\n\n"
+            "Use <code>/broadcast Your message</code> for text, or reply to an image/media message with <code>/broadcast</code>.\n"
+            "The bot will show a preview and ask you to confirm before sending.",
+            parse_mode="HTML",
+        )
+        return
+    if not firebase_ready():
+        await message.reply_text("<b>BROADCAST UNAVAILABLE</b>\n\nFirebase user records are not connected.", parse_mode="HTML")
+        return
+    try:
+        users = await asyncio.to_thread(firebase_reference("users").get)
+        total_users = len(registered_chat_ids(users))
+    except Exception as exc:
+        logger.error("Firebase users read failed for broadcast (%s)", type(exc).__name__)
+        await message.reply_text("<b>BROADCAST UNAVAILABLE</b>\n\nCould not load the registered user list.", parse_mode="HTML")
+        return
+    token = new_session_token(user.id, "broadcast")
+    PENDING_BROADCASTS[token] = {
+        "admin_id": user.id,
+        "payload": payload,
+        "created_at": time.time(),
+    }
+    keyboard = InlineKeyboardMarkup(
+        [[
+            keyboard_button("Confirm broadcast", callback_data=f"broadcast_confirm:{token}"),
+            keyboard_button("Cancel", callback_data=f"broadcast_cancel:{token}"),
+        ]]
+    )
+    await message.reply_text(
+        "BROADCAST PREVIEW\n\n"
+        f"Recipients: {total_users:,} registered users\n\n"
+        f"{description}\n\n"
+        "Confirm only if this is the exact message you want sent to every registered user.",
+        reply_markup=keyboard,
+    )
+
+
+async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str, *, cancel: bool) -> None:
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    if not ADMIN_ID or query.from_user.id != ADMIN_ID:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    pending = PENDING_BROADCASTS.get(token)
+    if not pending or pending.get("admin_id") != ADMIN_ID or time.time() - pending.get("created_at", 0) > 900:
+        PENDING_BROADCASTS.pop(token, None)
+        await query.answer("This broadcast preview has expired. Prepare it again.", show_alert=True)
+        return
+    if cancel:
+        PENDING_BROADCASTS.pop(token, None)
+        await query.answer("Broadcast cancelled.")
+        await query.edit_message_text("<b>BROADCAST CANCELLED</b>\n\nNothing was sent.", parse_mode="HTML")
+        return
+    if not firebase_ready():
+        await query.answer("User list unavailable.", show_alert=True)
+        return
+    try:
+        users = await asyncio.to_thread(firebase_reference("users").get)
+    except Exception as exc:
+        logger.error("Firebase users read failed during broadcast (%s)", type(exc).__name__)
+        await query.answer("Could not load the user list.", show_alert=True)
+        return
+    recipients = registered_chat_ids(users)
+    if not recipients:
+        PENDING_BROADCASTS.pop(token, None)
+        await query.answer("There are no registered recipients.", show_alert=True)
+        await query.edit_message_text("<b>BROADCAST NOT SENT</b>\n\nThere are no registered recipients.", parse_mode="HTML")
+        return
+    created_at = datetime.now(timezone.utc).isoformat()
+    job = {
+        "admin_id": int(ADMIN_ID),
+        "admin_message_id": int(query.message.message_id),
+        "payload": pending["payload"],
+        "recipient_ids": {str(chat_id): True for chat_id in recipients},
+        "sent_to": {},
+        "failed_to": {},
+        "status": "running",
+        "created_at": created_at,
+    }
+    try:
+        reference = firebase_reference(f"broadcast_jobs/{token}")
+        saved_job = await asyncio.to_thread(
+            reference.transaction,
+            lambda current: job if current is None else current,
+        )
+    except Exception as exc:
+        logger.error("Could not persist confirmed broadcast (%s)", type(exc).__name__)
+        await query.answer("Could not save this broadcast. Please try again.", show_alert=True)
+        return
+    if not isinstance(saved_job, dict) or saved_job.get("created_at") != created_at:
+        PENDING_BROADCASTS.pop(token, None)
+        await query.answer("This broadcast was already started.", show_alert=True)
+        return
+    PENDING_BROADCASTS.pop(token, None)
+    try:
+        await query.answer("Broadcast started.")
+        await query.edit_message_text(
+            f"<b>BROADCAST IN PROGRESS</b>\n\nSending to <b>{len(recipients):,}</b> registered users…",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        logger.warning("Could not update broadcast progress message (%s)", type(exc).__name__)
+    finally:
+        if not start_background_broadcast(token, context.application):
+            logger.error("Broadcast %s is stored and will resume after service restart", token)
 
 
 async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.channel_post:
         await index_channel_post(update)
         return
-    if update.my_chat_member:
-        await publish_new_destination(update, context)
-        return
     if update.callback_query:
-        if (update.callback_query.data or "").startswith("destination:"):
-            await destination_approval_callback(update, context)
-        elif (update.callback_query.data or "").startswith("file:"):
+        data = update.callback_query.data or ""
+        if data.startswith("file:"):
             await file_button_callback(update, context)
+        elif data.startswith("page:"):
+            await search_page_callback(update, context)
+        elif data.startswith("movie_request:"):
+            await movie_request_callback(update, context)
+        elif data.startswith("request_done:"):
+            await complete_movie_request_callback(update, context)
+        elif data.startswith("request_page:"):
+            await request_page_callback(update, context)
+        elif data.startswith("broadcast_confirm:"):
+            await send_broadcast(update, context, data.split(":", 1)[1], cancel=False)
+        elif data.startswith("broadcast_cancel:"):
+            await send_broadcast(update, context, data.split(":", 1)[1], cancel=True)
         else:
             await update.callback_query.answer("This button is no longer available.", show_alert=True)
         return
 
     message = update.effective_message
-    if not message or not update.effective_user or not message.text:
+    user = update.effective_user
+    if not message or not user:
         return
-    command, _, argument = message.text.partition(" ")
+    content = message.text or message.caption or ""
+    if not content:
+        return
+    command, _, argument = content.partition(" ")
     command = command.split("@", 1)[0].lower()
-    if command == "/start" or command == "/help":
+    if command in {"/start", "/help"}:
         await start_command(update, context)
-    elif command == "/shareall" and ADMIN_ID and update.effective_user.id == ADMIN_ID:
-        if not KNOWN_DESTINATIONS:
-            await message.reply_text(
-                "<b>NO DESTINATIONS YET</b>\n\nPromote the bot to administrator in a destination channel. "
-                "I will send you a private approval prompt.",
-                parse_mode="HTML",
-            )
-        else:
-            for destination_id, title in list(KNOWN_DESTINATIONS.items()):
-                await prompt_destination(destination_id, title, force=True)
-    elif command == "/status" and ADMIN_ID and update.effective_user.id == ADMIN_ID:
-        await message.reply_text(
-            "<b>MF MOVIE LIBRARY · SYSTEM STATUS</b>\n\n"
-            f"Firebase catalog: <b>{'Ready' if firebase_ready() else 'Not configured'}</b>\n"
-            f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
-            f"Approved destinations: <b>{len(APPROVED_DESTINATIONS)}</b>\n"
-            f"Pending approvals: <b>{len(PENDING_DESTINATIONS)}</b>\n"
-            f"Membership gate: <b>{'Enabled' if FORCE_JOIN_CHANNEL_ID else 'Not configured'}</b>\n"
-            f"New-post forwarding: <b>{'On' if AUTO_FORWARD_NEW else 'Off'}</b>\n"
-            f"Automatic file deletion: <b>{DELETE_AFTER_SECONDS // 60} minutes</b>",
-            parse_mode="HTML",
-        )
+    elif command in {"/status", "/stuts"}:
+        if ADMIN_ID and user.id == ADMIN_ID:
+            await status_command(update, context)
+    elif command in {"/request", "/requests"}:
+        if ADMIN_ID and user.id == ADMIN_ID:
+            await show_requests(update, context)
+    elif command == "/broadcast":
+        if ADMIN_ID and user.id == ADMIN_ID:
+            await prepare_broadcast(update, context, argument)
     elif command.startswith("/"):
         return
     else:
-        await search_command(update, context, message.text)
+        await search_command(update, context, content)
+
+
+async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message or not query.from_user:
+        return
+    if query.message.chat.type != "private":
+        await query.answer("Search results are available in your private chat.", show_alert=True)
+        return
+    await register_user(query.from_user)
+    try:
+        _, token, raw_offset = (query.data or "").split(":", 2)
+        offset = int(raw_offset)
+    except (ValueError, TypeError):
+        await query.answer("This results page is invalid. Search again.", show_alert=True)
+        return
+    session = SEARCH_SESSIONS.get(token)
+    if not session or session.get("user_id") != query.from_user.id:
+        await query.answer("This results page has expired. Search again.", show_alert=True)
+        return
+    if not await is_user_member(context.bot, query.from_user.id):
+        await query.answer("Join our required channel to unlock the catalog.", show_alert=True)
+        keyboard = await force_join_keyboard(context.bot)
+        if keyboard:
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="<b>MEMBERSHIP REQUIRED</b>\n\nJoin the channel, then tap Next or Back again.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+        return
+    await query.answer()
+    await send_chat_action(context.bot, query.from_user.id, "typing")
+    try:
+        matches = await search_catalog(str(session["query"]))
+    except Exception as exc:
+        logger.error("Firebase paginated search failed (%s)", type(exc).__name__)
+        await query.edit_message_text("<b>SEARCH TEMPORARILY UNAVAILABLE</b>\n\nPlease search again shortly.", parse_mode="HTML")
+        return
+    if not matches:
+        await query.edit_message_text(
+            f"<b>NO MATCHES FOUND</b>\n\nWe couldn't find <code>{html.escape(str(session['query'])[:100])}</code>. "
+            "Try another spelling or send a request to the admin.",
+            parse_mode="HTML",
+            reply_markup=no_results_keyboard(query.from_user.id, str(session["query"])),
+        )
+        SEARCH_SESSIONS.pop(token, None)
+        return
+    if offset >= len(matches):
+        offset = max(0, ((len(matches) - 1) // MAX_SEARCH_RESULTS) * MAX_SEARCH_RESULTS)
+    await query.edit_message_text(
+        search_page_text(str(session["query"]), len(matches), offset),
+        parse_mode="HTML",
+        reply_markup=search_page_keyboard(matches, token, offset),
+    )
 
 
 async def resolve_source_channels(application: Application) -> None:
     SOURCE_CHANNEL_IDS.clear()
     if not TELEGRAM_SOURCE_CHATS:
-        logger.warning("No TELEGRAM_SOURCE_CHATS configured; new source posts will not be indexed")
+        logger.warning("No source channels configured; new posts will not be indexed")
         return
     for source in TELEGRAM_SOURCE_CHATS:
         try:
@@ -890,9 +1525,12 @@ async def resolve_source_channels(application: Application) -> None:
 async def configure_bot(application: Application) -> None:
     await application.bot.set_my_commands(
         [
-            BotCommand("start", "Start the movie search bot"),
-            BotCommand("shareall", "Admin: request destination approval"),
-            BotCommand("status", "Admin: show bot status"),
+            BotCommand("start", "Open the movie library"),
+            BotCommand("status", "Admin: view realtime library statistics"),
+            BotCommand("stuts", "Admin: view realtime library statistics"),
+            BotCommand("request", "Admin: review movie requests"),
+            BotCommand("requests", "Admin: review movie requests"),
+            BotCommand("broadcast", "Admin: prepare a confirmed broadcast"),
         ]
     )
     if RENDER_EXTERNAL_URL:
@@ -917,9 +1555,9 @@ async def lifespan(application: FastAPI):
         await BOT_APP.initialize()
         await BOT_APP.start()
         await resolve_source_channels(BOT_APP)
-        await register_configured_destinations(BOT_APP)
         await configure_bot(BOT_APP)
         await restore_pending_deletions()
+        await resume_broadcast_jobs()
     else:
         logger.warning("BOT_TOKEN is missing; bot commands and channel indexing are disabled")
     yield
@@ -947,8 +1585,7 @@ app = FastAPI(title="MF Movie Search Bot", lifespan=lifespan)
 
 @app.get("/healthz")
 async def healthz():
-    return {
-        "ok": True,
+    status = {
         "bot_configured": bool(BOT_TOKEN),
         "bot_running": BOT_APP is not None,
         "firebase_configured": bool(FIREBASE_DATABASE_URL and FIREBASE_SERVICE_ACCOUNT_JSON),
@@ -959,6 +1596,18 @@ async def healthz():
         "search_result_limit": MAX_SEARCH_RESULTS,
         "delete_after_minutes": DELETE_AFTER_SECONDS // 60,
     }
+    ready = bool(
+        status["bot_configured"]
+        and status["bot_running"]
+        and status["firebase_ready"]
+        and status["source_channels_configured"]
+        and status["source_channels_resolved"] > 0
+        and status["force_join_configured"]
+    )
+    status["ok"] = ready
+    if not ready:
+        raise HTTPException(status_code=503, detail=status)
+    return status
 
 
 @app.get("/")
@@ -967,7 +1616,7 @@ async def home():
         "service": "MF Movie Search Bot",
         "purpose": "Send a movie title as a normal message to search the authorized catalog",
         "health": "/healthz",
-        "commands": ["/start", "/shareall", "/status"],
+        "commands": ["/start", "/status", "/requests", "/broadcast"],
     }
 
 

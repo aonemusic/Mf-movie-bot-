@@ -16,12 +16,6 @@ services:
         sync: false
       - key: FILE_BACKUP_CHANNEL_ID
         sync: false
-      - key: APPROVED_DESTINATION_CHANNEL_IDS
-        sync: false
-      - key: DESTINATION_CHANNEL_ID
-        sync: false
-      - key: AUTO_FORWARD_NEW
-        value: "true"
       - key: FORCE_JOIN_CHANNEL_ID
         sync: false
       - key: FORCE_JOIN_CHANNEL_URL
