@@ -109,20 +109,31 @@ class SearchAndMediaTests(unittest.TestCase):
             self.assertEqual(len(matches), 12)
         asyncio.run(run())
 
-    def test_search_pagination_shows_ten_blue_file_buttons_and_green_navigation(self):
+    def test_search_pagination_shows_size_first_labels_with_cycling_supported_colors(self):
         matches = [
             (f"-1001_{i}", {"file_name": f"Movie {i}.mkv", "file_size": i * 1024})
             for i in range(1, 23)
         ]
         keyboard = main.search_page_keyboard(matches, "session12345678", 0)
         self.assertEqual(len(keyboard.inline_keyboard), 11)
-        self.assertEqual(keyboard.inline_keyboard[0][0].style, "primary")
+        file_buttons = [row[0] for row in keyboard.inline_keyboard[:-1]]
+        channel_buttons = [row[1] for row in keyboard.inline_keyboard[:-1]]
+        self.assertEqual(
+            [button.style for button in file_buttons],
+            ["primary", "success", "danger", "primary", "success", "danger", "primary", "success", "danger", "primary"],
+        )
+        self.assertTrue(file_buttons[0].text.startswith("1.0 KB · Movie 1.mkv"))
+        self.assertEqual(len(channel_buttons), 10)
+        self.assertTrue(all(button.text == "Join Main Channel" for button in channel_buttons))
+        self.assertTrue(all(button.url == "https://t.me/mfmainchannel" for button in channel_buttons))
+        self.assertTrue(all(button.style == "danger" for button in channel_buttons))
         navigation = keyboard.inline_keyboard[-1]
         self.assertEqual(navigation[0].callback_data, "page:session12345678:10")
         self.assertEqual(navigation[0].style, "success")
 
         second_page = main.search_page_keyboard(matches, "session12345678", 10)
         self.assertEqual(len(second_page.inline_keyboard), 11)
+        self.assertEqual(second_page.inline_keyboard[0][0].style, "success")
         self.assertEqual(second_page.inline_keyboard[-1][0].text, "‹ Back")
         self.assertEqual(second_page.inline_keyboard[-1][1].text, "Next ›")
 
@@ -154,6 +165,74 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertEqual(main.upload_action_for_media("video"), "upload_video")
         self.assertEqual(main.upload_action_for_media("photo"), "upload_photo")
         self.assertEqual(main.upload_action_for_media("document"), "upload_document")
+
+    def test_successful_file_selection_sends_then_removes_search_results_and_blocks_duplicate(self):
+        events = []
+
+        async def copy_file(**kwargs):
+            events.append("file")
+            return SimpleNamespace(message_id=88)
+
+        async def delete_results(**kwargs):
+            events.append("results")
+            return True
+
+        async def send_notice(**kwargs):
+            events.append("notice")
+            return SimpleNamespace(message_id=89)
+
+        bot = SimpleNamespace(
+            send_chat_action=AsyncMock(),
+            copy_message=AsyncMock(side_effect=copy_file),
+            delete_message=AsyncMock(side_effect=delete_results),
+            edit_message_reply_markup=AsyncMock(),
+            send_message=AsyncMock(side_effect=send_notice),
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(type="private"),
+            chat_id=77,
+            message_id=33,
+        )
+        query = SimpleNamespace(
+            message=message,
+            from_user=SimpleNamespace(id=77),
+            data="file:-1001_7",
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(callback_query=query)
+        context = SimpleNamespace(bot=bot)
+
+        async def run():
+            with patch.object(main, "ACTIVE_FILE_MESSAGES", set()), patch.object(
+                main, "CONSUMED_FILE_MESSAGES", {}
+            ), patch.object(main, "register_user", new=AsyncMock()), patch.object(
+                main, "FORCE_JOIN_CHANNEL_ID", "-1002"
+            ), patch.object(main, "is_user_member", new=AsyncMock(return_value=True)
+            ), patch.object(main, "firebase_ready", return_value=True), patch.object(
+                main,
+                "get_catalog_entry",
+                new=AsyncMock(
+                    return_value={
+                        "media_type": "video",
+                        "source_chat_id": -1001,
+                        "source_message_id": 7,
+                        "file_name": "Movie.mkv",
+                    }
+                ),
+            ), patch.object(main, "persist_pending_delete", new=AsyncMock()) as persist, patch.object(
+                main, "schedule_file_deletion"
+            ) as schedule:
+                await main.file_button_callback(update, context)
+                await main.file_button_callback(update, context)
+                self.assertEqual(persist.await_count, 1)
+                schedule.assert_called_once()
+
+        asyncio.run(run())
+        self.assertEqual(events, ["file", "results", "notice"])
+        bot.copy_message.assert_awaited_once_with(chat_id=77, from_chat_id=-1001, message_id=7)
+        bot.delete_message.assert_awaited_once_with(chat_id=77, message_id=33)
+        self.assertEqual(query.answer.await_count, 2)
+        self.assertIn("already used", query.answer.await_args.args[0])
 
     def test_search_counts_and_top_searches_are_persisted_in_firebase_paths(self):
         refs = {}

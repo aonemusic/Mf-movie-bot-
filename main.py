@@ -77,6 +77,7 @@ TELEGRAM_SOURCE_CHATS = configured_source_chat_refs(
 )
 FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip()
+MAIN_CHANNEL_URL = "https://t.me/mfmainchannel"
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -96,6 +97,8 @@ FILE_CATALOG_CACHE: dict[str, dict[str, Any]] = {}
 FILE_CATALOG_CACHE_AT = 0.0
 DELETE_TASKS: dict[str, asyncio.Task] = {}
 SEARCH_SESSIONS: dict[str, dict[str, Any]] = {}
+ACTIVE_FILE_MESSAGES: set[tuple[int, int]] = set()
+CONSUMED_FILE_MESSAGES: dict[tuple[int, int], float] = {}
 MOVIE_REQUEST_SESSIONS: dict[str, dict[str, Any]] = {}
 PENDING_BROADCASTS: dict[str, dict[str, Any]] = {}
 USER_REGISTER_LOCK = asyncio.Lock()
@@ -221,9 +224,9 @@ def message_link(chat, message_id: int) -> str:
 
 def result_button_text(record: dict[str, Any]) -> str:
     name = str(record.get("file_name") or "Untitled file").replace("\n", " ").strip()
-    if len(name) > 43:
-        name = f"{name[:40]}…"
-    return f"{name} · {format_file_size(record.get('file_size'))}"[:64]
+    if len(name) > 48:
+        name = f"{name[:45]}…"
+    return f"{format_file_size(record.get('file_size'))} · {name}"[:64]
 
 
 def media_caption(record: dict[str, Any]) -> str:
@@ -459,9 +462,18 @@ def make_search_session(user_id: int, title: str) -> str:
 def search_page_keyboard(
     matches: list[tuple[str, dict[str, Any]]], token: str, offset: int
 ) -> InlineKeyboardMarkup:
+    file_styles = ("primary", "success", "danger")
+    page_matches = matches[offset : offset + MAX_SEARCH_RESULTS]
     rows = [
-        [keyboard_button(result_button_text(record), callback_data=f"file:{key}", style="primary")]
-        for key, record in matches[offset : offset + MAX_SEARCH_RESULTS]
+        [
+            keyboard_button(
+                result_button_text(record),
+                callback_data=f"file:{key}",
+                style=file_styles[(offset + index) % len(file_styles)],
+            ),
+            keyboard_button("Join Main Channel", url=MAIN_CHANNEL_URL, style="danger"),
+        ]
+        for index, (key, record) in enumerate(page_matches)
     ]
     nav: list[InlineKeyboardButton] = []
     if offset > 0:
@@ -482,7 +494,7 @@ def search_page_text(query: str, total: int, offset: int) -> str:
         f"<b>YOUR RESULTS</b> · {first}–{last} of {total} file(s)\n"
         f"<i>Page {page} of {pages}</i>\n\n"
         f"Choose a file matching <code>{html.escape(query[:100])}</code>. "
-        "Each button shows the file name and size."
+        "Each button shows the file size first, followed by the file name."
     )
 
 
@@ -737,6 +749,24 @@ async def restore_pending_deletions() -> None:
             logger.warning("Skipped one invalid scheduled deletion record")
 
 
+async def remove_used_search_message(query, context) -> None:
+    if not query.message:
+        return
+    chat_id = int(query.message.chat_id)
+    message_id = int(query.message.message_id)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramError as exc:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=message_id,
+                reply_markup=None,
+            )
+        except TelegramError:
+            logger.info("Could not remove one used search result message (%s)", type(exc).__name__)
+
+
 async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.message or not query.from_user:
@@ -769,60 +799,81 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not firebase_ready():
         await query.answer("The catalog is not ready yet. Please try again shortly.", show_alert=True)
         return
-    await query.answer("Sending your file…")
-    await send_chat_action(context.bot, query.from_user.id, "typing")
-    try:
-        record = await get_catalog_entry(key)
-    except Exception as exc:
-        logger.error("Firebase file lookup failed (%s)", type(exc).__name__)
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="<b>DELIVERY TEMPORARILY UNAVAILABLE</b>\n\nPlease try again shortly.",
-            parse_mode="HTML",
-        )
+
+    result_message_key = (int(query.message.chat_id), int(query.message.message_id))
+    now = time.time()
+    for old_key, used_at in list(CONSUMED_FILE_MESSAGES.items()):
+        if now - used_at > DELETE_AFTER_SECONDS:
+            CONSUMED_FILE_MESSAGES.pop(old_key, None)
+    if result_message_key in CONSUMED_FILE_MESSAGES:
+        await query.answer("These results were already used. Send the movie title again to search.")
         return
-    if not record:
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="<b>FILE NO LONGER AVAILABLE</b>\n\nPlease search again for an updated result.",
-            parse_mode="HTML",
-        )
-        return
-    action = upload_action_for_media(str(record.get("media_type", "document")))
-    await send_chat_action(context.bot, query.from_user.id, action)
-    try:
-        copied = await context.bot.copy_message(
-            chat_id=query.from_user.id,
-            from_chat_id=int(record["source_chat_id"]),
-            message_id=int(record["source_message_id"]),
-        )
-    except TelegramError as exc:
-        logger.warning("Telegram could not copy one indexed source message (%s)", type(exc).__name__)
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="<b>DELIVERY UNAVAILABLE</b>\n\nTelegram could not copy this item. It may have been removed from the archive.",
-            parse_mode="HTML",
-        )
+    if result_message_key in ACTIVE_FILE_MESSAGES:
+        await query.answer("A file from these results is already being sent. Please wait.")
         return
 
-    delete_at = int(time.time()) + DELETE_AFTER_SECONDS
-    deletion_key = f"{query.from_user.id}_{copied.message_id}"
-    deletion_record = {
-        "chat_id": int(query.from_user.id),
-        "message_id": int(copied.message_id),
-        "delete_at": delete_at,
-    }
-    await persist_pending_delete(deletion_key, deletion_record)
-    schedule_file_deletion(deletion_key, query.from_user.id, copied.message_id, delete_at)
-    await context.bot.send_message(
-        chat_id=query.from_user.id,
-        text=(
-            f"<b>DELIVERY COMPLETE</b>\n\n"
-            f"<code>{html.escape(str(record.get('file_name', 'File'))[:180])}</code> is ready. "
-            "This copy will be automatically removed from this chat in <b>10 minutes</b>."
-        ),
-        parse_mode="HTML",
-    )
+    ACTIVE_FILE_MESSAGES.add(result_message_key)
+    try:
+        await query.answer("Sending your file…")
+        await send_chat_action(context.bot, query.from_user.id, "typing")
+        try:
+            record = await get_catalog_entry(key)
+        except Exception as exc:
+            logger.error("Firebase file lookup failed (%s)", type(exc).__name__)
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="<b>DELIVERY TEMPORARILY UNAVAILABLE</b>\n\nPlease try again shortly.",
+                parse_mode="HTML",
+            )
+            return
+        if not record:
+            CONSUMED_FILE_MESSAGES[result_message_key] = time.time()
+            await remove_used_search_message(query, context)
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="<b>FILE NO LONGER AVAILABLE</b>\n\nPlease search again for an updated result.",
+                parse_mode="HTML",
+            )
+            return
+        action = upload_action_for_media(str(record.get("media_type", "document")))
+        await send_chat_action(context.bot, query.from_user.id, action)
+        try:
+            copied = await context.bot.copy_message(
+                chat_id=query.from_user.id,
+                from_chat_id=int(record["source_chat_id"]),
+                message_id=int(record["source_message_id"]),
+            )
+        except TelegramError as exc:
+            logger.warning("Telegram could not copy one indexed source message (%s)", type(exc).__name__)
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="<b>DELIVERY UNAVAILABLE</b>\n\nTelegram could not copy this item. It may have been removed from the archive.",
+                parse_mode="HTML",
+            )
+            return
+
+        CONSUMED_FILE_MESSAGES[result_message_key] = time.time()
+        delete_at = int(time.time()) + DELETE_AFTER_SECONDS
+        deletion_key = f"{query.from_user.id}_{copied.message_id}"
+        deletion_record = {
+            "chat_id": int(query.from_user.id),
+            "message_id": int(copied.message_id),
+            "delete_at": delete_at,
+        }
+        await persist_pending_delete(deletion_key, deletion_record)
+        schedule_file_deletion(deletion_key, query.from_user.id, copied.message_id, delete_at)
+        await remove_used_search_message(query, context)
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=(
+                f"<b>DELIVERY COMPLETE</b>\n\n"
+                f"<code>{html.escape(str(record.get('file_name', 'File'))[:180])}</code> is ready. "
+                "This copy will be automatically removed from this chat in <b>10 minutes</b>."
+            ),
+            parse_mode="HTML",
+        )
+    finally:
+        ACTIVE_FILE_MESSAGES.discard(result_message_key)
 
 
 async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -6,12 +6,12 @@ A Telegram Bot API application for an authorized movie archive. It indexes new m
 
 - New source-channel media is indexed in Firebase with its title/filename, type, size, source IDs, source link where available, and timestamp. Media bytes remain in Telegram; they are not downloaded to Render or Firebase.
 - `FILE_BACKUP_CHANNEL_ID` is an optional additional archive source. It is added alongside (not instead of) `TELEGRAM_SOURCE_CHATS`.
-- Users send a movie title or filename as an ordinary message. Search results show up to ten file buttons per page with Next and Back navigation.
+- Users send a movie title or filename as an ordinary message. Search results show up to ten file buttons per page with Next and Back navigation. Each file row also has a red **Join Main Channel** button linking to `https://t.me/mfmainchannel`. After a file is successfully selected, the bot removes that results message and its buttons so it cannot be used again; the selected file is delivered privately.
 - If no result is found, a user can request the movie. The admin reviews open requests using `/requests` (or `/request`) and marks a request as added after uploading the file. The bot then notifies every requester to search again.
 - The bot stores unique user/chat IDs, total file count, total searches, and top-search counters in Firebase Realtime Database. `/status` (or `/stuts`) reports these statistics and reconciles the totals against stored users, files, and search counts. User records are created when a user starts or uses the bot; historical Telegram users cannot be discovered retroactively.
 - The admin can prepare a text broadcast of up to 3,200 characters with `/broadcast Your message`, or reply to an image/media message with `/broadcast`. The bot shows the exact text/media choice and sends nothing until the admin presses **Confirm broadcast**. Confirmed jobs and per-user delivery progress are stored in Firebase, sent in the background, and resumed after a service restart. Delivery totals are reported afterward. Only users who have interacted with the bot are eligible recipients.
 - A selected archive post is copied into the user's private chat. The bot attempts to delete that copy after ten minutes; pending deletion metadata is stored in Firebase and restored after service restarts.
-- File buttons use Telegram's blue `primary` style. Other action buttons use the green `success` style. Telegram clients may display styles differently or ignore them if their app version is old.
+- File buttons cycle through Telegram's supported blue `primary`, green `success`, and red `danger` styles. The Main Channel button uses red `danger`. Telegram does not offer arbitrary rainbow colors for individual inline buttons; clients may display styles differently or ignore them if their app version is old.
 
 ## Render environment variables
 
