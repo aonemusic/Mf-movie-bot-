@@ -6,6 +6,7 @@ A Telegram Bot API application for an authorized movie archive. It indexes new m
 
 - New source-channel media is indexed in Firebase with its title/filename, type, size, source IDs, source link where available, and timestamp. Media bytes remain in Telegram; they are not downloaded to Render or Firebase.
 - `FILE_BACKUP_CHANNEL_ID` is an optional additional archive source. It is added alongside (not instead of) `TELEGRAM_SOURCE_CHATS`.
+- Each newly uploaded media post in `FILE_BACKUP_CHANNEL_ID` is indexed and announced once in `FORCE_JOIN_CHANNEL_ID` (the main channel) as a clean English filename/size post with a **Get File** button. The button opens a signed bot link; users must have started the bot privately to receive the file. Duplicate Telegram updates do not create duplicate announcements.
 - Users send a movie title or filename as an ordinary message in private chat or in a group. Group results use secure bot deep links: tapping a file opens the bot and delivers the selected item privately after the user starts the bot. Group results show up to ten file buttons per page with Next and Back navigation. Each file row also has a red **Join Main Channel** button linking to `https://t.me/mfmainchannel`.
 - If no result is found, a user can request the movie. The admin reviews open requests using `/requests` (or `/request`) and marks a request as added after uploading the file. The bot then notifies every requester to search again.
 - The bot stores unique user/chat IDs, total file count, total searches, and top-search counters in Firebase Realtime Database. `/status` (or `/stuts`) reports these statistics and reconciles the totals against stored users, files, and search counts. User records are created when a user starts or uses the bot; historical Telegram users cannot be discovered retroactively.
@@ -38,11 +39,11 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 ## Telegram setup
 
 1. Set the environment variables above in Render. This version uses the Telegram Bot API only; `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `TELEGRAM_SESSION_STRING` are not needed.
-2. Add the bot as an administrator in each source channel so Telegram sends it `channel_post` updates. Confirm `TELEGRAM_SOURCE_CHATS` and, if used, `FILE_BACKUP_CHANNEL_ID` identify those channels.
-3. Add the bot as an administrator in the force-join channel so Telegram can reliably verify membership. For a private channel, set a valid `FORCE_JOIN_CHANNEL_URL` invite link.
+2. Add the bot as an administrator in each source channel so Telegram sends it `channel_post` updates. Confirm `TELEGRAM_SOURCE_CHATS` and `FILE_BACKUP_CHANNEL_ID` identify the DB/file upload channel.
+3. Add the bot as an administrator in the main/force-join channel so it can post new-file announcements and reliably verify membership. For a private channel, set a valid `FORCE_JOIN_CHANNEL_URL` invite link.
 4. Add the bot as an administrator in each group where it should read ordinary movie-title messages. Alternatively, disable the bot's group privacy mode in BotFather. Users can also search in groups by sending `/search Movie Name`.
 5. Open the bot and send `/start` as the configured admin. A user must press **Start** in the bot the first time a group file link opens; Telegram does not allow bots to initiate private chats. Users must start or interact with the bot before it can receive broadcasts.
-6. Add new authorized media posts to a configured source channel. The bot indexes each new post automatically.
+6. Add new authorized media posts to the DB channel. The bot indexes each new post and publishes a filename/size announcement with a **Get File** button to the main channel.
 
 ## User and admin commands
 
@@ -52,7 +53,7 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 - If there are more than ten matches, use the green Next and Back buttons to browse pages.
 - If a title has no matches, select **Request this movie**. The admin receives a notice and can manage the request queue with `/requests` or `/request`.
 - `/status` or `/stuts` — admin only; displays unique users who have started the bot privately or searched in a group, total indexed files, total searches, and top searches. Group-only users are analytics-only and cannot receive direct-message broadcasts until they start the bot privately.
-- `/broadcast Your message` — admin only; previews a text message (up to 3,200 characters) and requires a confirmation button. For an image/media broadcast, send the image first and reply to it with `/broadcast`, then confirm the preview.
+- `/broadcast Your message` — admin only; text-only broadcasts (up to 3,200 characters) are ready now: the bot previews the message and requires a confirmation button before sending. Image/media broadcasts are optional and are not required.
 - `/healthz` — public, secret-free readiness check for Render. Returns HTTP 200 only when the bot, Firebase, at least one source channel, and force-join configuration are ready; returns HTTP 503 otherwise.
 
 Render Free services may sleep or restart. Firebase stores the searchable catalog, analytics, user IDs needed for bot messaging, request records, and pending delivery deletions; it does not store the actual media files. Telegram remains the source of media. Users need access to a source post for the bot to copy it successfully.

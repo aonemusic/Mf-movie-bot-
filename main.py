@@ -305,6 +305,26 @@ def group_search_page_keyboard(
     return InlineKeyboardMarkup(rows)
 
 
+def new_file_announcement_text(record: dict[str, Any]) -> str:
+    name = html.escape(str(record.get("file_name") or "Untitled file")[:240])
+    size = format_file_size(record.get("file_size"))
+    return (
+        "<b>NEW MOVIE ADDED</b>\n\n"
+        f"🎬 <code>{name}</code>\n"
+        f"📦 <b>Size:</b> {html.escape(size)}\n\n"
+        "Tap below to open the file in the bot."
+    )
+
+
+def new_file_announcement_keyboard(key: str) -> InlineKeyboardMarkup:
+    if not BOT_USERNAME:
+        raise ValueError("Bot identity is not ready")
+    payload = make_file_start_payload(key)
+    return InlineKeyboardMarkup(
+        [[keyboard_button("Get File", url=f"https://t.me/{BOT_USERNAME}?start={payload}", style="primary")]]
+    )
+
+
 def media_caption(record: dict[str, Any]) -> str:
     name = str(record.get("file_name") or "Movie file")
     return f"🎬 <code>{html.escape(name[:900])}</code>"
@@ -834,7 +854,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
     )
 
 
-async def save_new_media_post(message, record: dict[str, Any]) -> None:
+async def save_new_media_post(message, record: dict[str, Any]) -> bool:
     global FILE_CATALOG_CACHE_AT
     key = f"{message.chat.id}_{message.message_id}"
     async with CATALOG_WRITE_LOCK:
@@ -849,6 +869,7 @@ async def save_new_media_post(message, record: dict[str, Any]) -> None:
             else:
                 await increment_stat("stats/total_files")
     FILE_CATALOG_CACHE_AT = time.monotonic()
+    return existing is None
 
 
 async def index_channel_post(update: Update) -> None:
@@ -870,10 +891,31 @@ async def index_channel_post(update: Update) -> None:
         logger.warning("A source media post arrived, but Firebase is not configured")
         return
     try:
-        await save_new_media_post(message, record)
+        is_new = await save_new_media_post(message, record)
         logger.info("Indexed one new media post")
     except Exception as exc:
         logger.error("Firebase write failed for one source post (%s)", type(exc).__name__)
+        return
+    if not (
+        is_new
+        and FILE_BACKUP_CHANNEL_ID
+        and int(message.chat.id) == int(chat_reference(FILE_BACKUP_CHANNEL_ID))
+        and FORCE_JOIN_CHANNEL_ID
+        and BOT_APP
+        and BOT_USERNAME
+    ):
+        return
+    try:
+        key = f"{message.chat.id}_{message.message_id}"
+        await BOT_APP.bot.send_message(
+            chat_id=chat_reference(FORCE_JOIN_CHANNEL_ID),
+            text=new_file_announcement_text(record),
+            parse_mode="HTML",
+            reply_markup=new_file_announcement_keyboard(key),
+        )
+        logger.info("Posted one new-file announcement to the main channel")
+    except Exception as exc:
+        logger.warning("Could not post one new-file announcement (%s); indexing succeeded", type(exc).__name__)
 
 
 async def persist_pending_delete(key: str, record: dict[str, int]) -> bool:
