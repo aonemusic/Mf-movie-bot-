@@ -114,7 +114,7 @@ class SearchAndMediaTests(unittest.TestCase):
             self.assertEqual(len(matches), 12)
         asyncio.run(run())
 
-    def test_search_pagination_shows_size_first_labels_with_cycling_supported_colors(self):
+    def test_search_results_keep_blue_file_buttons_and_green_navigation_without_channel_buttons(self):
         matches = [
             (f"-1001_{i}", {"file_name": f"Movie {i}.mkv", "file_size": i * 1024})
             for i in range(1, 23)
@@ -122,23 +122,17 @@ class SearchAndMediaTests(unittest.TestCase):
         keyboard = main.search_page_keyboard(matches, "session12345678", 0)
         self.assertEqual(len(keyboard.inline_keyboard), 11)
         file_buttons = [row[0] for row in keyboard.inline_keyboard[:-1]]
-        channel_buttons = [row[1] for row in keyboard.inline_keyboard[:-1]]
-        self.assertEqual(
-            [button.style for button in file_buttons],
-            ["primary", "success", "danger", "primary", "success", "danger", "primary", "success", "danger", "primary"],
-        )
+        self.assertTrue(all(button.style == "primary" for button in file_buttons))
         self.assertTrue(file_buttons[0].text.startswith("1.0 KB · Movie 1.mkv"))
-        self.assertEqual(len(channel_buttons), 10)
-        self.assertTrue(all(button.text == "Join Main Channel" for button in channel_buttons))
-        self.assertTrue(all(button.url == "https://t.me/mfmainchannel" for button in channel_buttons))
-        self.assertTrue(all(button.style == "danger" for button in channel_buttons))
+        self.assertTrue(all(len(row) == 1 for row in keyboard.inline_keyboard[:-1]))
+        self.assertFalse(any(button.text == "Join Main Channel" for row in keyboard.inline_keyboard for button in row))
         navigation = keyboard.inline_keyboard[-1]
         self.assertEqual(navigation[0].callback_data, "page:session12345678:10")
         self.assertEqual(navigation[0].style, "success")
 
         second_page = main.search_page_keyboard(matches, "session12345678", 10)
         self.assertEqual(len(second_page.inline_keyboard), 11)
-        self.assertEqual(second_page.inline_keyboard[0][0].style, "success")
+        self.assertEqual(second_page.inline_keyboard[0][0].style, "primary")
         self.assertEqual(second_page.inline_keyboard[-1][0].text, "‹ Back")
         self.assertEqual(second_page.inline_keyboard[-1][1].text, "Next ›")
 
@@ -157,10 +151,19 @@ class SearchAndMediaTests(unittest.TestCase):
                 "group-session",
                 0,
             )
-            file_button, channel_button = keyboard.inline_keyboard[0]
+            file_button = keyboard.inline_keyboard[0][0]
             self.assertEqual(file_button.url, f"https://t.me/mf_movie_library_bot?start={payload}")
             self.assertTrue(file_button.text.startswith("1.0 KB · Example.Movie.mkv"))
-            self.assertEqual(channel_button.url, "https://t.me/mfmainchannel")
+            self.assertEqual(file_button.style, "primary")
+            self.assertEqual(len(keyboard.inline_keyboard[0]), 1)
+
+    def test_delivered_file_keyboard_places_red_main_and_green_request_group_links(self):
+        keyboard = main.delivered_file_keyboard()
+        main_button, requests_button = keyboard.inline_keyboard[0]
+        self.assertEqual(main_button.url, "https://t.me/mfmainchannel")
+        self.assertEqual(main_button.style, "danger")
+        self.assertEqual(requests_button.url, "https://t.me/MFMovieandSeriesRequestGroup")
+        self.assertEqual(requests_button.style, "success")
 
     def test_new_file_announcement_has_filename_size_and_get_file_deep_link(self):
         record = {"file_name": "Movie <HD>.mkv", "file_size": 1024 * 1024}
@@ -359,7 +362,16 @@ class SearchAndMediaTests(unittest.TestCase):
                 self.assertEqual(schedule.call_args_list[0].args[-1], schedule.call_args_list[1].args[-1])
 
         asyncio.run(run())
-        bot.copy_message.assert_awaited_once_with(chat_id=77, from_chat_id=-1001, message_id=9)
+        bot.copy_message.assert_awaited_once()
+        copy_args = bot.copy_message.await_args.kwargs
+        self.assertEqual(
+            {key: copy_args[key] for key in ("chat_id", "from_chat_id", "message_id")},
+            {"chat_id": 77, "from_chat_id": -1001, "message_id": 9},
+        )
+        self.assertEqual(
+            [button.url for button in copy_args["reply_markup"].inline_keyboard[0]],
+            ["https://t.me/mfmainchannel", "https://t.me/MFMovieandSeriesRequestGroup"],
+        )
         self.assertIn("removed automatically", bot.send_message.await_args.kwargs["text"])
 
     def test_request_keyboard_has_callback_and_green_style(self):
@@ -468,7 +480,14 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(events, ["file", "results", "notice"])
-        bot.copy_message.assert_awaited_once_with(chat_id=77, from_chat_id=-1001, message_id=7)
+        bot.copy_message.assert_awaited_once()
+        copy_args = bot.copy_message.await_args.kwargs
+        self.assertEqual(
+            {key: copy_args[key] for key in ("chat_id", "from_chat_id", "message_id")},
+            {"chat_id": 77, "from_chat_id": -1001, "message_id": 7},
+        )
+        self.assertEqual(copy_args["reply_markup"].inline_keyboard[0][0].style, "danger")
+        self.assertEqual(copy_args["reply_markup"].inline_keyboard[0][1].style, "success")
         bot.delete_message.assert_awaited_once_with(chat_id=77, message_id=33)
         self.assertEqual(query.answer.await_count, 2)
         self.assertIn("already used", query.answer.await_args.args[0])

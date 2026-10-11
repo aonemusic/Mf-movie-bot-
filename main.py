@@ -84,6 +84,7 @@ MOVIE_ANNOUNCEMENT_CHANNELS = [
 FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip()
 MAIN_CHANNEL_URL = "https://t.me/mfmainchannel"
+MOVIE_REQUEST_GROUP_URL = "https://t.me/MFMovieandSeriesRequestGroup"
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
@@ -288,18 +289,16 @@ def group_search_page_keyboard(
     matches: list[tuple[str, dict[str, Any]]], token: str, offset: int
 ) -> InlineKeyboardMarkup:
     rows = []
-    file_styles = ("primary", "success", "danger")
-    for index, (key, record) in enumerate(matches[offset : offset + MAX_SEARCH_RESULTS]):
+    for key, record in matches[offset : offset + MAX_SEARCH_RESULTS]:
         payload = make_file_start_payload(key)
         file_url = f"https://t.me/{BOT_USERNAME}?start={payload}"
-        rows.append([
-            keyboard_button(
+        rows.append(
+            [keyboard_button(
                 result_button_text(record),
                 url=file_url,
-                style=file_styles[(offset + index) % len(file_styles)],
-            ),
-            keyboard_button("Join Main Channel", url=MAIN_CHANNEL_URL, style="danger"),
-        ])
+                style="primary",
+            )]
+        )
     nav: list[InlineKeyboardButton] = []
     if offset > 0:
         nav.append(keyboard_button("‹ Back", callback_data=f"page:{token}:{max(0, offset - MAX_SEARCH_RESULTS)}"))
@@ -327,6 +326,16 @@ def new_file_announcement_keyboard(key: str) -> InlineKeyboardMarkup:
     payload = make_file_start_payload(key)
     return InlineKeyboardMarkup(
         [[keyboard_button("Get File", url=f"https://t.me/{BOT_USERNAME}?start={payload}", style="primary")]]
+    )
+
+
+def delivered_file_keyboard() -> InlineKeyboardMarkup:
+    """Keep channel links beside the delivered file and its copied caption."""
+    return InlineKeyboardMarkup(
+        [[
+            keyboard_button("Join Main Channel", url=MAIN_CHANNEL_URL, style="danger"),
+            keyboard_button("Movie Request Group", url=MOVIE_REQUEST_GROUP_URL, style="success"),
+        ]]
     )
 
 
@@ -656,18 +665,14 @@ def make_search_session(user_id: int, title: str, *, chat_id: int | None = None,
 def search_page_keyboard(
     matches: list[tuple[str, dict[str, Any]]], token: str, offset: int
 ) -> InlineKeyboardMarkup:
-    file_styles = ("primary", "success", "danger")
     page_matches = matches[offset : offset + MAX_SEARCH_RESULTS]
     rows = [
-        [
-            keyboard_button(
+        [keyboard_button(
                 result_button_text(record),
                 callback_data=f"file:{key}",
-                style=file_styles[(offset + index) % len(file_styles)],
-            ),
-            keyboard_button("Join Main Channel", url=MAIN_CHANNEL_URL, style="danger"),
-        ]
-        for index, (key, record) in enumerate(page_matches)
+                style="primary",
+            )]
+        for key, record in page_matches
     ]
     nav: list[InlineKeyboardButton] = []
     if offset > 0:
@@ -850,6 +855,7 @@ async def deliver_group_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
             chat_id=user.id,
             from_chat_id=int(record["source_chat_id"]),
             message_id=int(record["source_message_id"]),
+            reply_markup=delivered_file_keyboard(),
         )
     except TelegramError as exc:
         logger.info("Telegram could not deliver one group-selected file (%s)", type(exc).__name__)
@@ -1182,6 +1188,7 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 chat_id=query.from_user.id,
                 from_chat_id=int(record["source_chat_id"]),
                 message_id=int(record["source_message_id"]),
+                reply_markup=delivered_file_keyboard(),
             )
         except TelegramError as exc:
             logger.warning("Telegram could not copy one indexed source message (%s)", type(exc).__name__)
