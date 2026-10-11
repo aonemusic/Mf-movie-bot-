@@ -325,6 +325,21 @@ def new_file_announcement_keyboard(key: str) -> InlineKeyboardMarkup:
     )
 
 
+def movie_announcement_destinations() -> list[int | str]:
+    """Return all configured source channels and the main/force-join channel once each."""
+    destinations: list[int | str] = sorted(SOURCE_CHANNEL_IDS)
+    if FORCE_JOIN_CHANNEL_ID:
+        destinations.append(chat_reference(FORCE_JOIN_CHANNEL_ID))
+    unique: list[int | str] = []
+    seen: set[str] = set()
+    for destination in destinations:
+        key = str(destination).strip()
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(destination)
+    return unique
+
+
 def media_caption(record: dict[str, Any]) -> str:
     name = str(record.get("file_name") or "Movie file")
     return f"🎬 <code>{html.escape(name[:900])}</code>"
@@ -896,26 +911,20 @@ async def index_channel_post(update: Update) -> None:
     except Exception as exc:
         logger.error("Firebase write failed for one source post (%s)", type(exc).__name__)
         return
-    if not (
-        is_new
-        and FILE_BACKUP_CHANNEL_ID
-        and int(message.chat.id) == int(chat_reference(FILE_BACKUP_CHANNEL_ID))
-        and FORCE_JOIN_CHANNEL_ID
-        and BOT_APP
-        and BOT_USERNAME
-    ):
+    if not (is_new and BOT_APP and BOT_USERNAME):
         return
-    try:
-        key = f"{message.chat.id}_{message.message_id}"
-        await BOT_APP.bot.send_message(
-            chat_id=chat_reference(FORCE_JOIN_CHANNEL_ID),
-            text=new_file_announcement_text(record),
-            parse_mode="HTML",
-            reply_markup=new_file_announcement_keyboard(key),
-        )
-        logger.info("Posted one new-file announcement to the main channel")
-    except Exception as exc:
-        logger.warning("Could not post one new-file announcement (%s); indexing succeeded", type(exc).__name__)
+    key = f"{message.chat.id}_{message.message_id}"
+    for destination in movie_announcement_destinations():
+        try:
+            await BOT_APP.bot.send_message(
+                chat_id=destination,
+                text=new_file_announcement_text(record),
+                parse_mode="HTML",
+                reply_markup=new_file_announcement_keyboard(key),
+            )
+            logger.info("Posted one new-file announcement to a configured channel")
+        except Exception as exc:
+            logger.warning("Could not post one new-file announcement (%s); indexing succeeded", type(exc).__name__)
 
 
 async def persist_pending_delete(key: str, record: dict[str, int]) -> bool:

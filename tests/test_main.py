@@ -171,7 +171,7 @@ class SearchAndMediaTests(unittest.TestCase):
             self.assertEqual(button.text, "Get File")
             self.assertEqual(main.file_key_from_start_payload(payload), "-1004443404016_88")
 
-    def test_new_db_upload_is_announced_once_in_main_channel(self):
+    def test_new_upload_is_announced_once_to_all_configured_channels(self):
         chat = SimpleNamespace(id=-1004443404016, title="DB archive", username=None)
         post = SimpleNamespace(chat=chat, message_id=88)
         update = SimpleNamespace(channel_post=post)
@@ -180,34 +180,36 @@ class SearchAndMediaTests(unittest.TestCase):
         record = {"file_name": "Movie.mkv", "file_size": 1024}
 
         async def run():
-            with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016}), patch.object(
-                main, "FILE_BACKUP_CHANNEL_ID", "-1004443404016"
-            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"), patch.object(
-                main, "BOT_APP", application
-            ), patch.object(main, "BOT_USERNAME", "mf_movie_library_bot"), patch.object(
-                main, "BOT_TOKEN", "123456:unit-test-token"
-            ), patch.object(main, "firebase_ready", return_value=True), patch.object(
-                main, "extract_media_details", return_value=record
-            ), patch.object(main, "save_new_media_post", new=AsyncMock(return_value=True)) as save:
+            with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016, -1004443404020}), patch.object(
+                main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
+            ), patch.object(main, "BOT_APP", application), patch.object(
+                main, "BOT_USERNAME", "mf_movie_library_bot"
+            ), patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+                main, "firebase_ready", return_value=True
+            ), patch.object(main, "extract_media_details", return_value=record), patch.object(
+                main, "save_new_media_post", new=AsyncMock(return_value=True)
+            ) as save:
                 await main.index_channel_post(update)
                 save.assert_awaited_once()
-            bot.send_message.assert_awaited_once()
-            self.assertEqual(bot.send_message.await_args.kwargs["chat_id"], -1004352245988)
-            self.assertIn("Movie.mkv", bot.send_message.await_args.kwargs["text"])
             self.assertEqual(
-                bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard[0][0].text,
+                [call.kwargs["chat_id"] for call in bot.send_message.await_args_list],
+                [-1004443404020, -1004443404016, -1004352245988],
+            )
+            self.assertIn("Movie.mkv", bot.send_message.await_args_list[0].kwargs["text"])
+            self.assertEqual(
+                bot.send_message.await_args_list[0].kwargs["reply_markup"].inline_keyboard[0][0].text,
                 "Get File",
             )
             bot.send_message.reset_mock()
-            with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016}), patch.object(
-                main, "FILE_BACKUP_CHANNEL_ID", "-1004443404016"
-            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"), patch.object(
-                main, "BOT_APP", application
-            ), patch.object(main, "BOT_USERNAME", "mf_movie_library_bot"), patch.object(
-                main, "BOT_TOKEN", "123456:unit-test-token"
-            ), patch.object(main, "firebase_ready", return_value=True), patch.object(
-                main, "extract_media_details", return_value=record
-            ), patch.object(main, "save_new_media_post", new=AsyncMock(return_value=False)):
+            with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016, -1004443404020}), patch.object(
+                main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
+            ), patch.object(main, "BOT_APP", application), patch.object(
+                main, "BOT_USERNAME", "mf_movie_library_bot"
+            ), patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+                main, "firebase_ready", return_value=True
+            ), patch.object(main, "extract_media_details", return_value=record), patch.object(
+                main, "save_new_media_post", new=AsyncMock(return_value=False)
+            ):
                 await main.index_channel_post(update)
             bot.send_message.assert_not_awaited()
 

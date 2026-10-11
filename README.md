@@ -6,7 +6,7 @@ A Telegram Bot API application for an authorized movie archive. It indexes new m
 
 - New source-channel media is indexed in Firebase with its title/filename, type, size, source IDs, source link where available, and timestamp. Media bytes remain in Telegram; they are not downloaded to Render or Firebase.
 - `FILE_BACKUP_CHANNEL_ID` is an optional additional archive source. It is added alongside (not instead of) `TELEGRAM_SOURCE_CHATS`.
-- Each newly uploaded media post in `FILE_BACKUP_CHANNEL_ID` is indexed and announced once in `FORCE_JOIN_CHANNEL_ID` (the main channel) as a clean English filename/size post with a **Get File** button. The button opens a signed bot link; users must have started the bot privately to receive the file. Duplicate Telegram updates do not create duplicate announcements.
+- Each newly uploaded media post in a configured source channel is indexed and announced once in every resolved configured source channel and in `FORCE_JOIN_CHANNEL_ID` (the main channel), as a clean English filename/size post with a **Get File** button. The button opens a signed bot link; users must have started the bot privately to receive the file. Duplicate Telegram updates do not create duplicate announcements. Telegram does not provide the bot with a list of every channel where it is an admin, so each source channel must be listed in `TELEGRAM_SOURCE_CHATS` or `FILE_BACKUP_CHANNEL_ID`.
 - Users send a movie title or filename as an ordinary message in private chat or in a group. Group results use secure bot deep links: tapping a file opens the bot and delivers the selected item privately after the user starts the bot. Group results show up to ten file buttons per page with Next and Back navigation. Each file row also has a red **Join Main Channel** button linking to `https://t.me/mfmainchannel`.
 - If no result is found, a user can request the movie. The admin reviews open requests using `/requests` (or `/request`) and marks a request as added after uploading the file. The bot then notifies every requester to search again.
 - The bot stores unique user/chat IDs, total file count, total searches, and top-search counters in Firebase Realtime Database. `/status` (or `/stuts`) reports these statistics and reconciles the totals against stored users, files, and search counts. User records are created when a user starts or uses the bot; historical Telegram users cannot be discovered retroactively.
@@ -39,11 +39,11 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 ## Telegram setup
 
 1. Set the environment variables above in Render. This version uses the Telegram Bot API only; `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `TELEGRAM_SESSION_STRING` are not needed.
-2. Add the bot as an administrator in each source channel so Telegram sends it `channel_post` updates. Confirm `TELEGRAM_SOURCE_CHATS` and `FILE_BACKUP_CHANNEL_ID` identify the DB/file upload channel.
+2. Add the bot as an administrator in each source and announcement channel so Telegram sends it `channel_post` updates and allows it to post. List every such channel in `TELEGRAM_SOURCE_CHATS` and/or `FILE_BACKUP_CHANNEL_ID`.
 3. Add the bot as an administrator in the main/force-join channel so it can post new-file announcements and reliably verify membership. For a private channel, set a valid `FORCE_JOIN_CHANNEL_URL` invite link.
 4. Add the bot as an administrator in each group where it should read ordinary movie-title messages. Alternatively, disable the bot's group privacy mode in BotFather. Users can also search in groups by sending `/search Movie Name`.
 5. Open the bot and send `/start` as the configured admin. A user must press **Start** in the bot the first time a group file link opens; Telegram does not allow bots to initiate private chats. Users must start or interact with the bot before it can receive broadcasts.
-6. Add new authorized media posts to the DB channel. The bot indexes each new post and publishes a filename/size announcement with a **Get File** button to the main channel.
+6. Add new authorized media posts to any configured source channel. The bot indexes each new post and publishes a filename/size announcement with a **Get File** button in every configured source channel and the main channel.
 
 ## User and admin commands
 
