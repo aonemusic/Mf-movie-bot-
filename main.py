@@ -76,6 +76,11 @@ def configured_source_chat_refs(primary: str, backup: str = "") -> list[str]:
 TELEGRAM_SOURCE_CHATS = configured_source_chat_refs(
     os.getenv("TELEGRAM_SOURCE_CHATS", ""), FILE_BACKUP_CHANNEL_ID
 )
+MOVIE_ANNOUNCEMENT_CHANNELS = [
+    item.strip()
+    for item in os.getenv("MOVIE_ANNOUNCEMENT_CHANNELS", "").split(",")
+    if item.strip()
+]
 FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip()
 MAIN_CHANNEL_URL = "https://t.me/mfmainchannel"
@@ -326,8 +331,9 @@ def new_file_announcement_keyboard(key: str) -> InlineKeyboardMarkup:
 
 
 def movie_announcement_destinations() -> list[int | str]:
-    """Return all configured source channels and the main/force-join channel once each."""
+    """Return all configured source, extra announcement and main channels once each."""
     destinations: list[int | str] = sorted(SOURCE_CHANNEL_IDS)
+    destinations.extend(chat_reference(item) for item in MOVIE_ANNOUNCEMENT_CHANNELS)
     if FORCE_JOIN_CHANNEL_ID:
         destinations.append(chat_reference(FORCE_JOIN_CHANNEL_ID))
     unique: list[int | str] = []
@@ -601,6 +607,36 @@ def make_movie_request_session(user_id: int, title: str) -> str:
     return token
 
 
+def make_movie_request_start_payload(user_id: int, title: str) -> str:
+    token = make_movie_request_session(user_id, title)
+    compact = f"r{_base36(user_id)}_{token}"
+    payload = f"{compact}_{make_file_payload_signature(compact)}"
+    if len(payload) > 64:
+        raise ValueError("Movie request link payload is too long")
+    return payload
+
+
+def movie_request_token_from_start_payload(payload: str, user_id: int) -> str | None:
+    if not BOT_TOKEN or not isinstance(payload, str):
+        return None
+    try:
+        compact, tag = payload.rsplit("_", 1)
+        prefix, token = compact.split("_", 1)
+        if prefix != f"r{_base36(user_id)}":
+            return None
+        if not hmac.compare_digest(tag, make_file_payload_signature(compact)):
+            return None
+        session = MOVIE_REQUEST_SESSIONS.get(token)
+        if not session or session.get("user_id") != user_id:
+            return None
+        if time.time() - float(session.get("created_at", 0)) > 3600:
+            MOVIE_REQUEST_SESSIONS.pop(token, None)
+            return None
+        return token
+    except (ValueError, TypeError):
+        return None
+
+
 def make_search_session(user_id: int, title: str, *, chat_id: int | None = None, group: bool = False) -> str:
     token = new_session_token(user_id, title)
     SEARCH_SESSIONS[token] = {
@@ -656,7 +692,16 @@ def search_page_text(query: str, total: int, offset: int) -> str:
     )
 
 
-def no_results_keyboard(user_id: int, title: str) -> InlineKeyboardMarkup:
+def no_results_keyboard(user_id: int, title: str, *, group: bool = False) -> InlineKeyboardMarkup:
+    if group and BOT_USERNAME:
+        payload = make_movie_request_start_payload(user_id, title)
+        return InlineKeyboardMarkup(
+            [[keyboard_button(
+                "Request this movie",
+                url=f"https://t.me/{BOT_USERNAME}?start={payload}",
+                style="success",
+            )]]
+        )
     token = make_movie_request_session(user_id, title)
     return InlineKeyboardMarkup(
         [[keyboard_button("Request this movie", callback_data=f"movie_request:{token}")]]
@@ -715,6 +760,39 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
     if user and message.chat.type == "private":
         await register_user(user)
         if payload:
+            if payload.startswith("r"):
+                token = movie_request_token_from_start_payload(payload, user.id)
+                if not token:
+                    await message.reply_text(
+                        "<b>REQUEST LINK EXPIRED</b>\n\nSearch for the movie again in the group and tap its request button.",
+                        parse_mode="HTML",
+                    )
+                    return
+                status, title, keyboard = await submit_movie_request(context.bot, user, token)
+                if status == "ok":
+                    await message.reply_text(
+                        "<b>REQUEST RECEIVED</b>\n\n"
+                        f"Your request for <code>{html.escape(title[:180])}</code> has been sent to the admin. "
+                        "If it is added, you will receive a message here.",
+                        parse_mode="HTML",
+                    )
+                elif status == "membership":
+                    await message.reply_text(
+                        "<b>MEMBERSHIP REQUIRED</b>\n\nJoin our channel, then open your movie request link again.",
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                elif status == "expired":
+                    await message.reply_text(
+                        "<b>REQUEST LINK EXPIRED</b>\n\nSearch for the movie again and tap its request button.",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await message.reply_text(
+                        "<b>REQUEST TEMPORARILY UNAVAILABLE</b>\n\nPlease try again shortly.",
+                        parse_mode="HTML",
+                    )
+                return
             key = file_key_from_start_payload(payload)
             if not key:
                 await message.reply_text(
@@ -846,7 +924,11 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
             f"<b>NO MATCHES FOUND</b>\n\nWe couldn't find a file matching <code>{html.escape(query_text[:100])}</code>. "
             "Try a shorter title or another spelling. You can also send a request to the admin.",
             parse_mode="HTML",
-            reply_markup=no_results_keyboard(user.id, query_text) if is_private else None,
+            reply_markup=(
+                no_results_keyboard(user.id, query_text, group=not is_private)
+                if is_private or BOT_USERNAME
+                else None
+            ),
         )
         return
     if not is_private and not BOT_USERNAME:
@@ -1142,58 +1224,40 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         ACTIVE_FILE_MESSAGES.discard(result_message_key)
 
 
-async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.from_user or not query.message:
-        return
-    if query.message.chat.type != "private":
-        await query.answer("Requests are available in your private chat with the bot.", show_alert=True)
-        return
-    await register_user(query.from_user)
-    token = (query.data or "").removeprefix("movie_request:")
+async def submit_movie_request(bot, user, token: str) -> tuple[str, str, InlineKeyboardMarkup | None]:
+    """Persist one request from either a private button or a signed group deep link."""
     request_session = MOVIE_REQUEST_SESSIONS.get(token)
-    if not request_session or request_session.get("user_id") != query.from_user.id:
-        await query.answer("This request button has expired. Please search again.", show_alert=True)
-        return
-    if not FORCE_JOIN_CHANNEL_ID or not await is_user_member(context.bot, query.from_user.id):
-        await query.answer("Join our required channel before sending a request.", show_alert=True)
-        keyboard = await force_join_keyboard(context.bot)
-        if keyboard:
-            await context.bot.send_message(
-                chat_id=query.from_user.id,
-                text="<b>MEMBERSHIP REQUIRED</b>\n\nJoin the channel, then send your movie request.",
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        return
-    if not firebase_ready():
-        await query.answer("Requests are temporarily unavailable. Please try again later.", show_alert=True)
-        return
+    if (
+        not request_session
+        or request_session.get("user_id") != user.id
+        or time.time() - float(request_session.get("created_at", 0)) > 3600
+    ):
+        MOVIE_REQUEST_SESSIONS.pop(token, None)
+        return "expired", "", None
     title = str(request_session["title"])
+    if not FORCE_JOIN_CHANNEL_ID or not await is_user_member(bot, user.id):
+        return "membership", title, await force_join_keyboard(bot)
+    if not firebase_ready():
+        return "unavailable", title, None
+
     normalized = normalize_search_text(title)
     request_key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
     reference = firebase_reference(f"movie_requests/{request_key}")
     before = await asyncio.to_thread(reference.get)
-    user_key = str(query.from_user.id)
+    user_key = str(user.id)
     now = datetime.now(timezone.utc).isoformat()
-    requester = {
-        "user_id": query.from_user.id,
-        "requested_at": now,
-    }
+    requester = {"user_id": user.id, "requested_at": now}
 
     def merge_request(current):
         record = current if isinstance(current, dict) else {}
         requesters = record.get("requesters") if isinstance(record.get("requesters"), dict) else {}
         requesters = dict(requesters)
         requesters[user_key] = requester
-        status = record.get("status", "pending")
-        if status != "pending":
-            status = "pending"
         return {
             **record,
             "title": str(record.get("title") or title)[:180],
             "normalized_title": normalized[:180],
-            "status": status,
+            "status": "pending",
             "created_at": record.get("created_at", now),
             "updated_at": now,
             "requesters": requesters,
@@ -1204,26 +1268,54 @@ async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_T
         request_record = await asyncio.to_thread(reference.transaction, merge_request)
     except Exception as exc:
         logger.error("Firebase movie request write failed (%s)", type(exc).__name__)
-        await query.answer("Your request could not be saved. Please try again.", show_alert=True)
-        return
+        return "unavailable", title, None
+
     MOVIE_REQUEST_SESSIONS.pop(token, None)
-    await query.answer("Request sent to the admin.")
-    await query.edit_message_text(
-        f"<b>REQUEST RECEIVED</b>\n\n"
-        f"Your request for <code>{html.escape(title[:180])}</code> has been sent to the admin. "
-        "If it is added, you will receive a message here.",
-        parse_mode="HTML",
-    )
     existed_pending = isinstance(before, dict) and before.get("status") == "pending"
     existing_requesters = before.get("requesters", {}) if isinstance(before, dict) else {}
-    new_requester = user_key not in existing_requesters
-    if ADMIN_ID and (not existed_pending or new_requester):
+    if ADMIN_ID and (not existed_pending or user_key not in existing_requesters):
         current_count = int((request_record or {}).get("requester_count", 1) or 1)
         await notify_admin(
             "<b>NEW MOVIE REQUEST</b>\n\n"
             f"Title: <code>{html.escape(title[:180])}</code>\n"
             f"Requesters: <b>{current_count}</b>\n\n"
             "Open <code>/requests</code> to review it."
+        )
+    return "ok", title, None
+
+
+async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.from_user or not query.message:
+        return
+    if query.message.chat.type != "private":
+        await query.answer("Open the request in your private chat with the bot.", show_alert=True)
+        return
+    await register_user(query.from_user)
+    token = (query.data or "").removeprefix("movie_request:")
+    status, title, keyboard = await submit_movie_request(context.bot, query.from_user, token)
+    if status == "ok":
+        await query.answer("Request sent to the admin.")
+        await query.edit_message_text(
+            "<b>REQUEST RECEIVED</b>\n\n"
+            f"Your request for <code>{html.escape(title[:180])}</code> has been sent to the admin. "
+            "If it is added, you will receive a message here.",
+            parse_mode="HTML",
+        )
+    elif status == "membership":
+        await query.answer("Join our required channel before sending a request.", show_alert=True)
+        if keyboard:
+            await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text="<b>MEMBERSHIP REQUIRED</b>\n\nJoin the channel, then tap your request button again.",
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+    else:
+        await query.answer(
+            "This request link has expired. Search again." if status == "expired"
+            else "Requests are temporarily unavailable. Please try again later.",
+            show_alert=True,
         )
 
 
@@ -1822,8 +1914,12 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "Try another spelling or send a request to the admin.",
             parse_mode="HTML",
             reply_markup=(
-                no_results_keyboard(query.from_user.id, str(session["query"]))
-                if is_private
+                no_results_keyboard(
+                    query.from_user.id,
+                    str(session["query"]),
+                    group=not is_private,
+                )
+                if is_private or BOT_USERNAME
                 else None
             ),
         )

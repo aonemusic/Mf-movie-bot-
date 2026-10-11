@@ -53,6 +53,11 @@ class FakeTreeReference:
             raise TypeError("target is not an object")
         node.update(value)
 
+    def transaction(self, updater):
+        updated = updater(self.get())
+        self.set(updated)
+        return updated
+
 
 class SearchAndMediaTests(unittest.TestCase):
     def test_search_normalization_is_case_insensitive_and_unicode_safe(self):
@@ -181,6 +186,8 @@ class SearchAndMediaTests(unittest.TestCase):
 
         async def run():
             with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016, -1004443404020}), patch.object(
+                main, "MOVIE_ANNOUNCEMENT_CHANNELS", ["-1003391211397"]
+            ), patch.object(
                 main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
             ), patch.object(main, "BOT_APP", application), patch.object(
                 main, "BOT_USERNAME", "mf_movie_library_bot"
@@ -193,7 +200,7 @@ class SearchAndMediaTests(unittest.TestCase):
                 save.assert_awaited_once()
             self.assertEqual(
                 [call.kwargs["chat_id"] for call in bot.send_message.await_args_list],
-                [-1004443404020, -1004443404016, -1004352245988],
+                [-1004443404020, -1004443404016, -1003391211397, -1004352245988],
             )
             self.assertIn("Movie.mkv", bot.send_message.await_args_list[0].kwargs["text"])
             self.assertEqual(
@@ -202,6 +209,8 @@ class SearchAndMediaTests(unittest.TestCase):
             )
             bot.send_message.reset_mock()
             with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016, -1004443404020}), patch.object(
+                main, "MOVIE_ANNOUNCEMENT_CHANNELS", ["-1003391211397"]
+            ), patch.object(
                 main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
             ), patch.object(main, "BOT_APP", application), patch.object(
                 main, "BOT_USERNAME", "mf_movie_library_bot"
@@ -245,6 +254,72 @@ class SearchAndMediaTests(unittest.TestCase):
                 active_user.assert_awaited_once_with(update.effective_user)
             markup = message.reply_text.await_args.kwargs["reply_markup"]
             self.assertTrue(markup.inline_keyboard[0][0].url.startswith("https://t.me/mf_movie_library_bot?start="))
+        asyncio.run(run())
+
+    def test_group_no_results_offers_signed_private_request_link(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(type="supergroup"),
+            chat_id=-100123,
+            reply_text=AsyncMock(),
+        )
+        user = SimpleNamespace(id=77)
+        update = SimpleNamespace(effective_message=message, effective_user=user)
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+
+        async def run():
+            with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+                main, "BOT_USERNAME", "mf_movie_library_bot"
+            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"), patch.object(
+                main, "send_chat_action", new=AsyncMock()
+            ), patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+                main, "firebase_ready", return_value=True
+            ), patch.object(main, "record_active_user", new=AsyncMock()), patch.object(
+                main, "record_search", new=AsyncMock()
+            ), patch.object(main, "search_catalog", new=AsyncMock(return_value=[])):
+                await main.search_command(update, context, "Moonlight 2025")
+            button = message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+            self.assertEqual(button.text, "Request this movie")
+            self.assertTrue(button.url.startswith("https://t.me/mf_movie_library_bot?start=r"))
+            payload = button.url.split("?start=", 1)[1]
+            with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"):
+                token = main.movie_request_token_from_start_payload(payload, 77)
+                wrong_user_token = main.movie_request_token_from_start_payload(payload, 78)
+            self.assertIsNotNone(token)
+            self.assertEqual(main.MOVIE_REQUEST_SESSIONS[token]["title"], "Moonlight 2025")
+            self.assertIsNone(wrong_user_token)
+
+        asyncio.run(run())
+
+    def test_group_request_start_persists_request_for_the_button_user(self):
+        tree = {}
+        user = SimpleNamespace(id=77)
+        message = SimpleNamespace(chat=SimpleNamespace(type="private"), reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_user=user)
+        context = SimpleNamespace(bot=SimpleNamespace())
+
+        async def run():
+            with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+                main, "BOT_USERNAME", "mf_movie_library_bot"
+            ), patch.object(main, "ADMIN_ID", 0
+            ), patch.object(main, "register_user", new=AsyncMock()), patch.object(
+                main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
+            ), patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+                main, "firebase_ready", return_value=True
+            ), patch.object(
+                main,
+                "firebase_reference",
+                side_effect=lambda path: FakeTreeReference(tree, path),
+            ):
+                button = main.no_results_keyboard(77, "Moonlight 2025", group=True).inline_keyboard[0][0]
+                payload = button.url.split("?start=", 1)[1]
+                await main.start_command(update, context, payload)
+
+            self.assertIn("REQUEST RECEIVED", message.reply_text.await_args.args[0])
+            request = next(iter(tree["movie_requests"].values()))
+            self.assertEqual(request["title"], "Moonlight 2025")
+            self.assertEqual(request["requester_count"], 1)
+            self.assertIn("77", request["requesters"])
+
         asyncio.run(run())
 
     def test_signed_group_start_delivers_file_and_expires_file_and_notice(self):
