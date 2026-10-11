@@ -175,13 +175,16 @@ class SearchAndMediaTests(unittest.TestCase):
                 main, "register_user", new=AsyncMock()
             ) as register, patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
                 main, "firebase_ready", return_value=True
-            ), patch.object(main, "record_search", new=AsyncMock()), patch.object(
+            ), patch.object(main, "record_active_user", new=AsyncMock()) as active_user, patch.object(
+                main, "record_search", new=AsyncMock()
+            ), patch.object(
                 main,
                 "search_catalog",
                 new=AsyncMock(return_value=[("-1001_9", {"file_name": "Movie.mkv", "file_size": 2048})]),
             ):
                 await main.search_command(update, context, "Movie")
                 register.assert_not_awaited()
+                active_user.assert_awaited_once_with(update.effective_user)
             markup = message.reply_text.await_args.kwargs["reply_markup"]
             self.assertTrue(markup.inline_keyboard[0][0].url.startswith("https://t.me/mf_movie_library_bot?start="))
         asyncio.run(run())
@@ -351,9 +354,30 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
         self.assertEqual(refs["stats/total_searches"].value, 2)
-        top = next(value.value for path, value in refs.items() if path.startswith("stats/top_searches/"))
-        self.assertEqual(top["count"], 2)
-        self.assertEqual(top["query"], "the matrix 1999")
+        for path in ("analytics/top_searches/", "stats/top_searches/"):
+            top = next(value.value for key, value in refs.items() if key.startswith(path))
+            self.assertEqual(top["count"], 2)
+            self.assertEqual(top["query"], "the matrix 1999")
+
+    def test_active_user_tracking_deduplicates_group_users_without_private_registration(self):
+        refs = {}
+
+        def get_ref(path):
+            refs.setdefault(path, FakeReference())
+            return refs[path]
+
+        async def run():
+            with patch.object(main, "firebase_ready", return_value=True), patch.object(
+                main, "firebase_reference", side_effect=get_ref
+            ):
+                user = SimpleNamespace(id=77)
+                await main.record_active_user(user)
+                first_seen = refs["analytics/active_users/77"].value["first_seen_at"]
+                await main.record_active_user(user)
+                self.assertEqual(refs["analytics/active_users/77"].value["first_seen_at"], first_seen)
+
+        asyncio.run(run())
+        self.assertNotIn("users/77", refs)
 
     def test_user_registration_counts_unique_users_and_stores_minimal_fields(self):
         refs = {"stats/total_users": FakeReference(0)}
@@ -387,6 +411,12 @@ class SearchAndMediaTests(unittest.TestCase):
                     "two": {"query": "Beta", "count": 2},
                 },
             },
+            "analytics": {
+                "active_users": {"2": {}, "3": {}},
+                "top_searches": {
+                    "matrix": {"query": "The Matrix", "normalized_query": "the matrix", "count": 5}
+                },
+            },
         }
 
         async def run():
@@ -394,12 +424,13 @@ class SearchAndMediaTests(unittest.TestCase):
                 return await main.get_status_stats()
 
         stats = asyncio.run(run())
-        self.assertEqual(stats["total_users"], 2)
+        self.assertEqual(stats["total_users"], 3)
         self.assertEqual(stats["total_files"], 3)
-        self.assertEqual(stats["total_searches"], 6)
-        self.assertEqual(tree["stats"]["total_users"], 2)
+        self.assertEqual(stats["top_searches"][0]["query"], "The Matrix")
+        self.assertEqual(stats["total_searches"], 11)
+        self.assertEqual(tree["stats"]["total_users"], 3)
         self.assertEqual(tree["stats"]["total_files"], 3)
-        self.assertEqual(tree["stats"]["total_searches"], 6)
+        self.assertEqual(tree["stats"]["total_searches"], 11)
 
     def test_health_endpoint_reports_unready_as_503_and_ready_as_200_payload(self):
         async def run():

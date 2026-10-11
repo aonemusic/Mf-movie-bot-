@@ -51,7 +51,7 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 - Choose a file button in private chat to receive a copy. In a group, choose a file button to open the bot and deliver the copy privately; press **Start** if prompted. The file and delivery notice are automatically removed after ten minutes on a best-effort basis.
 - If there are more than ten matches, use the green Next and Back buttons to browse pages.
 - If a title has no matches, select **Request this movie**. The admin receives a notice and can manage the request queue with `/requests` or `/request`.
-- `/status` or `/stuts` — admin only; displays unique registered users, total indexed files, total searches, top searches, source status, and force-join status.
+- `/status` or `/stuts` — admin only; displays unique users who have started the bot privately or searched in a group, total indexed files, total searches, and top searches. Group-only users are analytics-only and cannot receive direct-message broadcasts until they start the bot privately.
 - `/broadcast Your message` — admin only; previews a text message (up to 3,200 characters) and requires a confirmation button. For an image/media broadcast, send the image first and reply to it with `/broadcast`, then confirm the preview.
 - `/healthz` — public, secret-free readiness check for Render. Returns HTTP 200 only when the bot, Firebase, at least one source channel, and force-join configuration are ready; returns HTTP 503 otherwise.
 

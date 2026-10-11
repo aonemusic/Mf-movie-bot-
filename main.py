@@ -437,12 +437,34 @@ async def register_user(user) -> None:
                 await increment_stat("stats/total_users")
 
 
+async def record_active_user(user) -> None:
+    """Record an eligible user without treating group-only users as DM recipients."""
+    if not firebase_ready() or not user:
+        return
+    user_id = int(user.id)
+    now = datetime.now(timezone.utc).isoformat()
+    reference = firebase_reference(f"analytics/active_users/{user_id}")
+
+    def update_activity(current):
+        previous = current if isinstance(current, dict) else {}
+        return {
+            "user_id": user_id,
+            "first_seen_at": previous.get("first_seen_at", now),
+            "last_seen_at": now,
+        }
+
+    await asyncio.to_thread(reference.transaction, update_activity)
+
+
 async def record_search(query: str) -> None:
     normalized = normalize_search_text(query)
     if not normalized:
         return
     search_key = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
-    reference = firebase_reference(f"stats/top_searches/{search_key}")
+    references = (
+        firebase_reference(f"analytics/top_searches/{search_key}"),
+        firebase_reference(f"stats/top_searches/{search_key}"),
+    )
     display_query = " ".join(query.split())[:120]
     now = datetime.now(timezone.utc).isoformat()
 
@@ -459,7 +481,8 @@ async def record_search(query: str) -> None:
             "last_searched_at": now,
         }
 
-    await asyncio.to_thread(reference.transaction, update_search)
+    for reference in references:
+        await asyncio.to_thread(reference.transaction, update_search)
     await increment_stat("stats/total_searches")
 
 
@@ -469,8 +492,10 @@ async def get_status_stats() -> dict[str, Any]:
         users = await asyncio.to_thread(firebase_reference("users").get)
         raw = await asyncio.to_thread(firebase_reference("stats").get)
         stats = raw if isinstance(raw, dict) else {}
-        searches = stats.get("top_searches", {})
-        top = [value for value in searches.values() if isinstance(value, dict)] if isinstance(searches, dict) else []
+        legacy_searches = stats.get("top_searches", {})
+        analytics = await asyncio.to_thread(firebase_reference("analytics").get)
+        analytics = analytics if isinstance(analytics, dict) else {}
+        active_users = analytics.get("active_users", {})
 
         def search_count(record: dict[str, Any]) -> int:
             try:
@@ -478,9 +503,29 @@ async def get_status_stats() -> dict[str, Any]:
             except (TypeError, ValueError):
                 return 0
 
+        search_sources = [legacy_searches, analytics.get("top_searches", {})]
+        unique_searches: dict[str, dict[str, Any]] = {}
+        for searches in search_sources:
+            if isinstance(searches, dict):
+                values = searches.values()
+            elif isinstance(searches, list):
+                values = (item for item in searches if item is not None)
+            else:
+                continue
+            for value in values:
+                if not isinstance(value, dict) or not value.get("query"):
+                    continue
+                normalized = str(value.get("normalized_query") or normalize_search_text(str(value["query"])))
+                previous = unique_searches.get(normalized)
+                if previous is None or search_count(value) > search_count(previous):
+                    unique_searches[normalized] = value
+        top = list(unique_searches.values())
         top.sort(key=search_count, reverse=True)
+        user_ids = set(users) if isinstance(users, dict) else set()
+        if isinstance(active_users, dict):
+            user_ids.update(active_users)
         totals = {
-            "total_users": len(users) if isinstance(users, dict) else 0,
+            "total_users": len(user_ids),
             "total_files": len(catalog),
             "total_searches": sum(search_count(record) for record in top),
         }
@@ -751,6 +796,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
         )
         return
     try:
+        await record_active_user(user)
         await record_search(query_text)
         matches = await search_catalog(query_text)
     except Exception as exc:
