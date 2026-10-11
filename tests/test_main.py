@@ -3,7 +3,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import main
 
@@ -112,6 +112,45 @@ class SearchAndMediaTests(unittest.TestCase):
             with patch.object(main, "get_catalog", new=AsyncMock(return_value=records)):
                 matches = await main.search_catalog("matrix")
             self.assertEqual(len(matches), 12)
+        asyncio.run(run())
+
+    def test_search_catalog_ranks_exact_title_ahead_of_partial_and_caption_matches(self):
+        records = {
+            "exact": {
+                "file_name": "Matrix.mkv",
+                "search_text": "matrix",
+                "indexed_at": "2024-01-01",
+            },
+            "partial": {
+                "file_name": "Matrix Reloaded.mkv",
+                "search_text": "matrix reloaded",
+                "indexed_at": "2026-01-01",
+            },
+            "caption": {
+                "file_name": "Cinema Collection.mkv",
+                "search_text": "cinema collection matrix reference",
+                "indexed_at": "2027-01-01",
+            },
+        }
+
+        async def run():
+            with patch.object(main, "get_catalog", new=AsyncMock(return_value=records)):
+                results = await main.search_catalog("matrix")
+            self.assertEqual([key for key, _ in results], ["exact", "partial", "caption"])
+
+        asyncio.run(run())
+
+    def test_latest_catalog_orders_by_upload_timestamp_newest_first(self):
+        records = {
+            "old": {"file_name": "Old.mkv", "indexed_at": "2025-01-01T00:00:00Z"},
+            "new": {"file_name": "New.mkv", "indexed_at": "2026-03-01T00:00:00Z"},
+        }
+
+        async def run():
+            with patch.object(main, "get_catalog", new=AsyncMock(return_value=records)):
+                results = await main.latest_catalog()
+            self.assertEqual([key for key, _ in results], ["new", "old"])
+
         asyncio.run(run())
 
     def test_search_results_keep_blue_file_buttons_and_green_navigation_without_channel_buttons(self):
@@ -241,7 +280,9 @@ class SearchAndMediaTests(unittest.TestCase):
                 main, "BOT_USERNAME", "mf_movie_library_bot"
             ), patch.object(
                 main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
-            ), patch.object(main, "send_chat_action", new=AsyncMock()), patch.object(
+            ), patch.object(main, "send_chat_action", new=AsyncMock()) as chat_action, patch.object(
+                main, "schedule_group_result_keyboard_removal", new=Mock()
+            ) as cleanup, patch.object(
                 main, "register_user", new=AsyncMock()
             ) as register, patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
                 main, "firebase_ready", return_value=True
@@ -255,8 +296,99 @@ class SearchAndMediaTests(unittest.TestCase):
                 await main.search_command(update, context, "Movie")
                 register.assert_not_awaited()
                 active_user.assert_awaited_once_with(update.effective_user)
+                chat_action.assert_awaited_once_with(context.bot, message.chat_id, "typing")
+                cleanup.assert_called_once_with(
+                    context.bot,
+                    message.chat_id,
+                    message.reply_text.return_value.message_id,
+                )
             markup = message.reply_text.await_args.kwargs["reply_markup"]
             self.assertTrue(markup.inline_keyboard[0][0].url.startswith("https://t.me/mf_movie_library_bot?start="))
+        asyncio.run(run())
+
+    def test_latest_command_and_pagination_work_in_groups_with_group_typing(self):
+        user = SimpleNamespace(id=79)
+        message = SimpleNamespace(
+            chat=SimpleNamespace(type="supergroup"),
+            chat_id=-100987,
+            text="/latest",
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            channel_post=None,
+            callback_query=None,
+            effective_message=message,
+            effective_user=user,
+        )
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=AsyncMock()))
+        movies = [
+            (f"-1001_{i}", {"file_name": f"Movie {i}.mkv", "file_size": i * 1024})
+            for i in range(1, 13)
+        ]
+
+        async def run():
+            with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+                main, "BOT_USERNAME", "mf_movie_library_bot"
+            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1002"), patch.object(
+                main, "send_chat_action", new=AsyncMock()
+            ) as typing, patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+                main, "firebase_ready", return_value=True
+            ), patch.object(main, "record_active_user", new=AsyncMock()), patch.object(
+                main, "register_user", new=AsyncMock()
+            ) as register, patch.object(main, "latest_catalog", new=AsyncMock(return_value=movies)), patch.object(main, "schedule_group_result_keyboard_removal", new=Mock()) as cleanup:
+                await main.dispatch_update(update, context)
+                typing.assert_awaited_once_with(context.bot, -100987, "typing")
+                register.assert_not_awaited()
+                cleanup.assert_called_once_with(
+                    context.bot, -100987, message.reply_text.return_value.message_id
+                )
+
+            first_markup = message.reply_text.await_args.kwargs["reply_markup"]
+            self.assertIn("JUST ADDED", message.reply_text.await_args.args[0])
+            next_button = first_markup.inline_keyboard[-1][0]
+            self.assertEqual(next_button.text, "Next ›")
+            self.assertEqual(next_button.style, "success")
+            _, token, offset = next_button.callback_data.split(":")
+            self.assertEqual(offset, "10")
+            self.assertEqual(main.SEARCH_SESSIONS[token]["mode"], "latest")
+
+            query = SimpleNamespace(
+                message=SimpleNamespace(chat=SimpleNamespace(type="supergroup"), chat_id=-100987, message_id=888),
+                from_user=user,
+                data=next_button.callback_data,
+                answer=AsyncMock(),
+                edit_message_text=AsyncMock(),
+            )
+            page_update = SimpleNamespace(callback_query=query)
+            with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+                main, "BOT_USERNAME", "mf_movie_library_bot"
+            ), patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+                main, "send_chat_action", new=AsyncMock()
+            ) as page_typing, patch.object(main, "latest_catalog", new=AsyncMock(return_value=movies)), patch.object(main, "schedule_group_result_keyboard_removal", new=Mock()) as page_cleanup:
+                await main.search_page_callback(page_update, context)
+                page_typing.assert_awaited_once_with(context.bot, -100987, "typing")
+                page_cleanup.assert_called_once_with(context.bot, -100987, 888)
+            self.assertIn("Page 2 of 2", query.edit_message_text.await_args.args[0])
+
+        asyncio.run(run())
+
+    def test_group_result_keyboard_is_removed_after_five_minutes(self):
+        bot = SimpleNamespace(edit_message_reply_markup=AsyncMock())
+
+        async def run():
+            with patch.object(main, "GROUP_KEYBOARD_TASKS", {}), patch.object(
+                main.asyncio, "sleep", new=AsyncMock()
+            ) as wait:
+                main.schedule_group_result_keyboard_removal(bot, -100123, 456)
+                task = main.GROUP_KEYBOARD_TASKS["-100123_456"]
+                await task
+                wait.assert_awaited_once_with(300)
+            bot.edit_message_reply_markup.assert_awaited_once_with(
+                chat_id=-100123,
+                message_id=456,
+                reply_markup=None,
+            )
+
         asyncio.run(run())
 
     def test_group_no_results_offers_signed_private_request_link(self):
@@ -274,12 +406,16 @@ class SearchAndMediaTests(unittest.TestCase):
                 main, "BOT_USERNAME", "mf_movie_library_bot"
             ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"), patch.object(
                 main, "send_chat_action", new=AsyncMock()
-            ), patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+            ), patch.object(main, "schedule_group_result_keyboard_removal", new=Mock()) as cleanup, patch.object(
+                main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
                 main, "firebase_ready", return_value=True
             ), patch.object(main, "record_active_user", new=AsyncMock()), patch.object(
                 main, "record_search", new=AsyncMock()
             ), patch.object(main, "search_catalog", new=AsyncMock(return_value=[])):
                 await main.search_command(update, context, "Moonlight 2025")
+                cleanup.assert_called_once_with(
+                    context.bot, message.chat_id, message.reply_text.return_value.message_id
+                )
             button = message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
             self.assertEqual(button.text, "Request this movie")
             self.assertTrue(button.url.startswith("https://t.me/mf_movie_library_bot?start=r"))

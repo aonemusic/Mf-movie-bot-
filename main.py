@@ -93,6 +93,7 @@ ADMIN_ID = int(_ADMIN_VALUE) if _ADMIN_VALUE.isdigit() else 0
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 BOT_USERNAME = ""
 DELETE_AFTER_SECONDS = 600
+GROUP_RESULT_BUTTON_TTL_SECONDS = 300
 MAX_SEARCH_RESULTS = 10
 REQUESTS_PER_PAGE = 20
 CACHE_SECONDS = 20
@@ -104,6 +105,7 @@ SOURCE_CHANNEL_IDS: set[int] = set()
 FILE_CATALOG_CACHE: dict[str, dict[str, Any]] = {}
 FILE_CATALOG_CACHE_AT = 0.0
 DELETE_TASKS: dict[str, asyncio.Task] = {}
+GROUP_KEYBOARD_TASKS: dict[str, asyncio.Task] = {}
 SEARCH_SESSIONS: dict[str, dict[str, Any]] = {}
 ACTIVE_FILE_MESSAGES: set[tuple[int, int]] = set()
 CONSUMED_FILE_MESSAGES: dict[tuple[int, int], float] = {}
@@ -589,16 +591,53 @@ async def get_status_stats() -> dict[str, Any]:
 
 async def search_catalog(query: str) -> list[tuple[str, dict[str, Any]]]:
     catalog = await get_catalog()
-    terms = normalize_search_text(query).split()
+    normalized_query = normalize_search_text(query)
+    terms = normalized_query.split()
     if not terms:
         return []
     found = [
         (key, record)
         for key, record in catalog.items()
-        if all(term in str(record.get("search_text", "")) for term in terms)
+        if all(
+            term in normalize_search_text(
+                str(record.get("search_text") or record.get("file_name") or "")
+            )
+            for term in terms
+        )
     ]
-    found.sort(key=lambda item: str(item[1].get("indexed_at", "")), reverse=True)
+    def relevance(record: dict[str, Any]) -> int:
+        file_name = str(record.get("file_name") or "")
+        title = normalize_search_text(os.path.splitext(file_name)[0])
+        full_text = normalize_search_text(str(record.get("search_text") or file_name))
+        if title == normalized_query:
+            return 1000
+        if title.startswith(normalized_query):
+            return 900
+        if normalized_query in title:
+            return 800
+        if all(term in title for term in terms):
+            return 700
+        if normalized_query in full_text:
+            return 500
+        return 100
+
+    found.sort(
+        key=lambda item: (relevance(item[1]), str(item[1].get("indexed_at", ""))),
+        reverse=True,
+    )
     return found
+
+
+async def latest_catalog() -> list[tuple[str, dict[str, Any]]]:
+    catalog = await get_catalog()
+    return sorted(
+        catalog.items(),
+        key=lambda item: (
+            str(item[1].get("indexed_at", "")),
+            int(item[1].get("source_message_id", 0) or 0),
+        ),
+        reverse=True,
+    )
 
 
 def new_session_token(user_id: int, value: str) -> str:
@@ -646,13 +685,21 @@ def movie_request_token_from_start_payload(payload: str, user_id: int) -> str | 
         return None
 
 
-def make_search_session(user_id: int, title: str, *, chat_id: int | None = None, group: bool = False) -> str:
+def make_search_session(
+    user_id: int,
+    title: str,
+    *,
+    chat_id: int | None = None,
+    group: bool = False,
+    mode: str = "search",
+) -> str:
     token = new_session_token(user_id, title)
     SEARCH_SESSIONS[token] = {
         "user_id": user_id,
         "query": title[:180],
         "chat_id": chat_id,
         "group": group,
+        "mode": mode,
         "created_at": time.time(),
     }
     if len(SEARCH_SESSIONS) > 1000:
@@ -694,6 +741,18 @@ def search_page_text(query: str, total: int, offset: int) -> str:
         f"<i>Page {page} of {pages}</i>\n\n"
         f"Choose a file matching <code>{html.escape(query[:100])}</code>. "
         "Each button shows the file size first, followed by the file name."
+    )
+
+
+def latest_page_text(total: int, offset: int) -> str:
+    first = offset + 1 if total else 0
+    last = min(offset + MAX_SEARCH_RESULTS, total)
+    page = offset // MAX_SEARCH_RESULTS + 1
+    pages = max(1, (total + MAX_SEARCH_RESULTS - 1) // MAX_SEARCH_RESULTS)
+    return (
+        f"<b>JUST ADDED</b> · {first}–{last} of {total} movie file(s)\n"
+        f"<i>Page {page} of {pages}</i>\n\n"
+        "Browse the newest additions to the library. Each button shows the file size first, followed by its name."
     )
 
 
@@ -821,7 +880,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
         "<b>MF MOVIE LIBRARY</b>\n"
         "<i>Your archive, beautifully within reach.</i>\n\n"
         "<b>Search</b>\n"
-        "Send a movie title or filename as a regular message. Browse results with Next and Back, then choose a file.\n\n"
+        "Send a movie title or filename as a regular message. Browse results with Next and Back, then choose a file.\n"
+        "Send /latest to browse the newest additions.\n\n"
         "<b>Can't find it?</b>\n"
         "Request a movie from the results message and the admin will review it.\n\n"
         "<b>Fast delivery</b>\n"
@@ -889,7 +949,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
     is_private = message.chat.type == "private"
     if not is_private and message.chat.type not in {"group", "supergroup"}:
         return
-    await send_chat_action(context.bot, user.id, "typing")
+    await send_chat_action(context.bot, message.chat_id, "typing")
     if is_private:
         await register_user(user)
     if not FORCE_JOIN_CHANNEL_ID:
@@ -926,7 +986,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
         )
         return
     if not matches:
-        await message.reply_text(
+        sent = await message.reply_text(
             f"<b>NO MATCHES FOUND</b>\n\nWe couldn't find a file matching <code>{html.escape(query_text[:100])}</code>. "
             "Try a shorter title or another spelling. You can also send a request to the admin.",
             parse_mode="HTML",
@@ -936,6 +996,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
                 else None
             ),
         )
+        if not is_private and BOT_USERNAME and sent:
+            schedule_group_result_keyboard_removal(context.bot, message.chat_id, sent.message_id)
         return
     if not is_private and not BOT_USERNAME:
         await message.reply_text("<b>GROUP DELIVERY UNAVAILABLE</b>\n\nPlease use the bot in a private chat for now.", parse_mode="HTML")
@@ -946,7 +1008,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
         chat_id=int(message.chat_id),
         group=not is_private,
     )
-    await message.reply_text(
+    sent = await message.reply_text(
         search_page_text(query_text, len(matches), 0),
         parse_mode="HTML",
         reply_markup=(
@@ -955,6 +1017,76 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
             else group_search_page_keyboard(matches, token, 0)
         ),
     )
+    if not is_private and sent:
+        schedule_group_result_keyboard_removal(context.bot, message.chat_id, sent.message_id)
+
+
+async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    is_private = message.chat.type == "private"
+    if not is_private and message.chat.type not in {"group", "supergroup"}:
+        return
+    await send_chat_action(context.bot, message.chat_id, "typing")
+    if is_private:
+        await register_user(user)
+    if not FORCE_JOIN_CHANNEL_ID:
+        await message.reply_text(
+            "<b>CATALOG TEMPORARILY UNAVAILABLE</b>\n\nThe membership channel has not been configured yet. Please try again later.",
+            parse_mode="HTML",
+        )
+        return
+    if not await is_user_member(context.bot, user.id):
+        await send_join_prompt(update, context)
+        return
+    if not firebase_ready():
+        await message.reply_text(
+            "<b>CATALOG SYNC IN PROGRESS</b>\n\nPlease try again shortly.",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        await record_active_user(user)
+        matches = await latest_catalog()
+    except Exception as exc:
+        logger.error("Firebase latest-catalog lookup failed (%s)", type(exc).__name__)
+        await message.reply_text(
+            "<b>LATEST MOVIES TEMPORARILY UNAVAILABLE</b>\n\nPlease try again in a moment.",
+            parse_mode="HTML",
+        )
+        return
+    if not matches:
+        await message.reply_text(
+            "<b>NO MOVIES AVAILABLE YET</b>\n\nNew additions will appear here as soon as they are indexed.",
+            parse_mode="HTML",
+        )
+        return
+    if not is_private and not BOT_USERNAME:
+        await message.reply_text(
+            "<b>GROUP DELIVERY UNAVAILABLE</b>\n\nPlease use the bot in a private chat for now.",
+            parse_mode="HTML",
+        )
+        return
+    token = make_search_session(
+        user.id,
+        "Latest Movies",
+        chat_id=int(message.chat_id),
+        group=not is_private,
+        mode="latest",
+    )
+    sent = await message.reply_text(
+        latest_page_text(len(matches), 0),
+        parse_mode="HTML",
+        reply_markup=(
+            search_page_keyboard(matches, token, 0)
+            if is_private
+            else group_search_page_keyboard(matches, token, 0)
+        ),
+    )
+    if not is_private and sent:
+        schedule_group_result_keyboard_removal(context.bot, message.chat_id, sent.message_id)
 
 
 async def save_new_media_post(message, record: dict[str, Any]) -> bool:
@@ -1071,6 +1203,38 @@ def schedule_file_deletion(key: str, chat_id: int, message_id: int, delete_at: i
     if existing and not existing.done():
         return
     DELETE_TASKS[key] = asyncio.create_task(delete_delivered_file(key, chat_id, message_id, delete_at))
+
+
+async def remove_group_result_keyboard_after_delay(key: str, bot, chat_id: int, message_id: int) -> None:
+    current_task = asyncio.current_task()
+    try:
+        await asyncio.sleep(GROUP_RESULT_BUTTON_TTL_SECONDS)
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=None,
+        )
+    except asyncio.CancelledError:
+        raise
+    except BadRequest:
+        logger.debug("Group result message no longer has removable buttons")
+    except TelegramError as exc:
+        logger.info("Could not remove one group result keyboard (%s)", type(exc).__name__)
+    except Exception as exc:
+        logger.warning("Group result keyboard cleanup failed (%s)", type(exc).__name__)
+    finally:
+        if GROUP_KEYBOARD_TASKS.get(key) is current_task:
+            GROUP_KEYBOARD_TASKS.pop(key, None)
+
+
+def schedule_group_result_keyboard_removal(bot, chat_id: int, message_id: int) -> None:
+    key = f"{chat_id}_{message_id}"
+    existing = GROUP_KEYBOARD_TASKS.get(key)
+    if existing and not existing.done():
+        existing.cancel()
+    GROUP_KEYBOARD_TASKS[key] = asyncio.create_task(
+        remove_group_result_keyboard_after_delay(key, bot, chat_id, message_id)
+    )
 
 
 async def restore_pending_deletions() -> None:
@@ -1854,6 +2018,8 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     command = command.split("@", 1)[0].lower()
     if command in {"/start", "/help"}:
         await start_command(update, context, argument if command == "/start" else "")
+    elif command == "/latest":
+        await latest_command(update, context)
     elif command in {"/search", "/movie"}:
         await search_command(update, context, argument)
     elif command in {"/status", "/stuts"}:
@@ -1908,34 +2074,43 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         return
     await query.answer()
-    await send_chat_action(context.bot, query.from_user.id, "typing")
+    await send_chat_action(context.bot, query.message.chat_id, "typing")
+    is_latest = session.get("mode") == "latest"
     try:
-        matches = await search_catalog(str(session["query"]))
+        matches = await latest_catalog() if is_latest else await search_catalog(str(session["query"]))
     except Exception as exc:
         logger.error("Firebase paginated search failed (%s)", type(exc).__name__)
         await query.edit_message_text("<b>SEARCH TEMPORARILY UNAVAILABLE</b>\n\nPlease search again shortly.", parse_mode="HTML")
         return
     if not matches:
-        await query.edit_message_text(
-            f"<b>NO MATCHES FOUND</b>\n\nWe couldn't find <code>{html.escape(str(session['query'])[:100])}</code>. "
-            "Try another spelling or send a request to the admin.",
-            parse_mode="HTML",
-            reply_markup=(
-                no_results_keyboard(
-                    query.from_user.id,
-                    str(session["query"]),
-                    group=not is_private,
-                )
-                if is_private or BOT_USERNAME
-                else None
-            ),
-        )
+        if is_latest:
+            await query.edit_message_text(
+                "<b>NO MOVIES AVAILABLE YET</b>\n\nNew additions will appear here as soon as they are indexed.",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(
+                f"<b>NO MATCHES FOUND</b>\n\nWe couldn't find <code>{html.escape(str(session['query'])[:100])}</code>. "
+                "Try another spelling or send a request to the admin.",
+                parse_mode="HTML",
+                reply_markup=(
+                    no_results_keyboard(
+                        query.from_user.id,
+                        str(session["query"]),
+                        group=not is_private,
+                    )
+                    if is_private or BOT_USERNAME
+                    else None
+                ),
+            )
         SEARCH_SESSIONS.pop(token, None)
         return
     if offset >= len(matches):
         offset = max(0, ((len(matches) - 1) // MAX_SEARCH_RESULTS) * MAX_SEARCH_RESULTS)
     await query.edit_message_text(
-        search_page_text(str(session["query"]), len(matches), offset),
+        latest_page_text(len(matches), offset)
+        if is_latest
+        else search_page_text(str(session["query"]), len(matches), offset),
         parse_mode="HTML",
         reply_markup=(
             search_page_keyboard(matches, token, offset)
@@ -1943,6 +2118,12 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             else group_search_page_keyboard(matches, token, offset)
         ),
     )
+    if not is_private:
+        schedule_group_result_keyboard_removal(
+            context.bot,
+            query.message.chat_id,
+            query.message.message_id,
+        )
 
 
 async def resolve_source_channels(application: Application) -> None:
@@ -1967,6 +2148,7 @@ async def configure_bot(application: Application) -> None:
         [
             BotCommand("start", "Open the movie library"),
             BotCommand("search", "Search the movie library"),
+            BotCommand("latest", "Browse the newest movie uploads"),
             BotCommand("status", "Admin: view realtime library statistics"),
             BotCommand("stuts", "Admin: view realtime library statistics"),
             BotCommand("request", "Admin: review movie requests"),
@@ -2006,6 +2188,10 @@ async def lifespan(application: FastAPI):
         task.cancel()
     if DELETE_TASKS:
         await asyncio.gather(*DELETE_TASKS.values(), return_exceptions=True)
+    for task in list(GROUP_KEYBOARD_TASKS.values()):
+        task.cancel()
+    if GROUP_KEYBOARD_TASKS:
+        await asyncio.gather(*GROUP_KEYBOARD_TASKS.values(), return_exceptions=True)
     if BOT_APP:
         try:
             await BOT_APP.stop()
