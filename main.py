@@ -64,6 +64,10 @@ else:
     WEBHOOK_SECRET = ""
 
 FILE_BACKUP_CHANNEL_ID = os.getenv("FILE_BACKUP_CHANNEL_ID", "").strip()
+ARCHIVE_MIRROR_SOURCE_CHANNEL_ID = os.getenv(
+    "ARCHIVE_MIRROR_SOURCE_CHANNEL_ID", FILE_BACKUP_CHANNEL_ID
+).strip()
+ARCHIVE_MIRROR_CHANNEL_ID = os.getenv("ARCHIVE_MIRROR_CHANNEL_ID", "").strip()
 
 
 def configured_source_chat_refs(primary: str, backup: str = "") -> list[str]:
@@ -98,6 +102,7 @@ MAX_SEARCH_RESULTS = 10
 REQUESTS_PER_PAGE = 20
 CACHE_SECONDS = 20
 BROADCAST_DELAY_SECONDS = 0.05
+ARCHIVE_MIRROR_DELAY_SECONDS = 3.0
 
 BOT_APP: Application | None = None
 FIREBASE_APP: firebase_admin.App | None = None
@@ -111,6 +116,11 @@ ACTIVE_FILE_MESSAGES: set[tuple[int, int]] = set()
 CONSUMED_FILE_MESSAGES: dict[tuple[int, int], float] = {}
 MOVIE_REQUEST_SESSIONS: dict[str, dict[str, Any]] = {}
 PENDING_BROADCASTS: dict[str, dict[str, Any]] = {}
+PENDING_ARCHIVE_MIRRORS: dict[str, dict[str, Any]] = {}
+ARCHIVE_MIRROR_TASKS: dict[str, asyncio.Task] = {}
+ARCHIVE_MIRROR_LOCKS: dict[str, asyncio.Lock] = {}
+ARCHIVE_MIRROR_SEND_LOCK = asyncio.Lock()
+ARCHIVE_MIRROR_LAST_SENT_AT = 0.0
 USER_REGISTER_LOCK = asyncio.Lock()
 CATALOG_WRITE_LOCK = asyncio.Lock()
 STAT_RECONCILE_LOCK = asyncio.Lock()
@@ -668,7 +678,11 @@ def movie_request_token_from_start_payload(payload: str, user_id: int) -> str | 
     if not BOT_TOKEN or not isinstance(payload, str):
         return None
     try:
-        compact, tag = payload.rsplit("_", 1)
+        tag_length = 11  # 8 HMAC bytes encoded as unpadded URL-safe base64
+        separator = len(payload) - tag_length - 1
+        if separator <= 0 or payload[separator] != "_":
+            return None
+        compact, tag = payload[:separator], payload[separator + 1 :]
         prefix, token = compact.split("_", 1)
         if prefix != f"r{_base36(user_id)}":
             return None
@@ -1095,6 +1109,14 @@ async def save_new_media_post(message, record: dict[str, Any]) -> bool:
     async with CATALOG_WRITE_LOCK:
         entry_ref = firebase_reference(f"files/{key}")
         existing = await asyncio.to_thread(entry_ref.get)
+        if isinstance(existing, dict):
+            for field in (
+                "archive_mirror_target_chat_id",
+                "archive_mirror_target_message_id",
+                "archive_mirrored_at",
+            ):
+                if field in existing and field not in record:
+                    record[field] = existing[field]
         total_ref = firebase_reference("stats/total_files")
         current_total = await asyncio.to_thread(total_ref.get) if existing is None else None
         await save_catalog_entry(key, record)
@@ -1105,6 +1127,416 @@ async def save_new_media_post(message, record: dict[str, Any]) -> bool:
                 await increment_stat("stats/total_files")
     FILE_CATALOG_CACHE_AT = time.monotonic()
     return existing is None
+
+
+def archive_mirror_source_matches(record: dict[str, Any]) -> bool:
+    if not ARCHIVE_MIRROR_SOURCE_CHANNEL_ID:
+        return False
+    try:
+        return int(record.get("source_chat_id")) == int(ARCHIVE_MIRROR_SOURCE_CHANNEL_ID)
+    except (TypeError, ValueError):
+        return str(record.get("source_chat_id", "")) == ARCHIVE_MIRROR_SOURCE_CHANNEL_ID
+
+
+def archive_mirror_record_is_done(record: dict[str, Any], target_chat_id: str | int) -> bool:
+    return (
+        str(record.get("archive_mirror_target_chat_id", "")) == str(target_chat_id)
+        and bool(record.get("archive_mirror_target_message_id"))
+    )
+
+
+async def archive_mirror_catalog_item(
+    key: str,
+    record: dict[str, Any],
+    *,
+    bot=None,
+    target_chat_id: str | int | None = None,
+) -> str:
+    global ARCHIVE_MIRROR_LAST_SENT_AT
+    if not archive_mirror_source_matches(record):
+        return "not_source"
+    target = target_chat_id if target_chat_id is not None else ARCHIVE_MIRROR_CHANNEL_ID
+    if not target:
+        return "not_configured"
+    target_ref = chat_reference(target)
+    lock = ARCHIVE_MIRROR_LOCKS.setdefault(key, asyncio.Lock())
+    async with lock:
+        latest = await get_catalog_entry(key)
+        current = dict(latest or record)
+        if archive_mirror_record_is_done(current, target_ref):
+            return "already_mirrored"
+        if not archive_mirror_source_matches(current):
+            return "not_source"
+        sender = bot or (BOT_APP.bot if BOT_APP else None)
+        if not sender:
+            return "bot_unavailable"
+        source_chat_id = int(current.get("source_chat_id", 0))
+        source_message_id = int(current.get("source_message_id", 0))
+        if not source_chat_id or not source_message_id:
+            return "invalid_source"
+        copied = None
+        async with ARCHIVE_MIRROR_SEND_LOCK:
+            wait_seconds = ARCHIVE_MIRROR_DELAY_SECONDS - (time.monotonic() - ARCHIVE_MIRROR_LAST_SENT_AT)
+            if ARCHIVE_MIRROR_LAST_SENT_AT and wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            for attempt in range(3):
+                try:
+                    copied = await sender.copy_message(
+                        chat_id=target_ref,
+                        from_chat_id=source_chat_id,
+                        message_id=source_message_id,
+                    )
+                    ARCHIVE_MIRROR_LAST_SENT_AT = time.monotonic()
+                    break
+                except RetryAfter as exc:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(max(retry_delay(exc) + 0.5, 1))
+        if not copied:
+            return "failed"
+        current.update(
+            {
+                "archive_mirror_target_chat_id": str(target_ref),
+                "archive_mirror_target_message_id": int(copied.message_id),
+                "archive_mirrored_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        await save_catalog_entry(key, current)
+        return "copied"
+
+
+async def archive_mirror_candidate_keys() -> list[str]:
+    catalog = await get_catalog(refresh=True)
+    target = chat_reference(ARCHIVE_MIRROR_CHANNEL_ID) if ARCHIVE_MIRROR_CHANNEL_ID else ""
+    candidates = []
+    for key, record in catalog.items():
+        if not archive_mirror_source_matches(record):
+            continue
+        if not record.get("source_message_id") or not record.get("source_chat_id"):
+            continue
+        if target and archive_mirror_record_is_done(record, target):
+            continue
+        candidates.append((key, record))
+    candidates.sort(
+        key=lambda item: (
+            int(item[1].get("source_message_id", 0) or 0),
+            item[0],
+        )
+    )
+    return [key for key, _ in candidates]
+
+
+async def prepare_archive_mirror_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        return
+    if message.chat.type != "private":
+        await message.reply_text(
+            "<b>PRIVATE ADMIN ACTION</b>\n\nRun /mirror_history in the bot's private chat.",
+            parse_mode="HTML",
+        )
+        return
+    if not ARCHIVE_MIRROR_SOURCE_CHANNEL_ID or not ARCHIVE_MIRROR_CHANNEL_ID:
+        await message.reply_text(
+            "<b>ARCHIVE MIRROR NOT CONFIGURED</b>\n\nSet the source and destination channel IDs in the bot environment.",
+            parse_mode="HTML",
+        )
+        return
+    if not firebase_ready():
+        await message.reply_text(
+            "<b>ARCHIVE MIRROR UNAVAILABLE</b>\n\nThe Firebase catalog is not connected.",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        item_keys = await archive_mirror_candidate_keys()
+    except Exception as exc:
+        logger.error("Could not prepare archive mirror preview (%s)", type(exc).__name__)
+        await message.reply_text(
+            "<b>ARCHIVE MIRROR UNAVAILABLE</b>\n\nCould not read the catalog. Please try again shortly.",
+            parse_mode="HTML",
+        )
+        return
+    if not item_keys:
+        await message.reply_text(
+            "<b>ARCHIVE MIRROR UP TO DATE</b>\n\nNo unmirrored files from the configured DB channel were found in the Firebase catalog.",
+            parse_mode="HTML",
+        )
+        return
+    token = new_session_token(user.id, "archive-mirror-history")
+    PENDING_ARCHIVE_MIRRORS[token] = {
+        "admin_id": int(user.id),
+        "source_channel_id": ARCHIVE_MIRROR_SOURCE_CHANNEL_ID,
+        "target_channel_id": ARCHIVE_MIRROR_CHANNEL_ID,
+        "item_keys": item_keys,
+        "created_at": time.time(),
+    }
+    eta_minutes = max(1, (len(item_keys) * int(ARCHIVE_MIRROR_DELAY_SECONDS) + 59) // 60)
+    keyboard = InlineKeyboardMarkup(
+        [[
+            keyboard_button("Confirm mirror", callback_data=f"archive_mirror_confirm:{token}"),
+            keyboard_button("Cancel", callback_data=f"archive_mirror_cancel:{token}"),
+        ]]
+    )
+    await message.reply_text(
+        "<b>ARCHIVE MIRROR PREVIEW</b>\n\n"
+        f"Source DB channel: <code>{html.escape(ARCHIVE_MIRROR_SOURCE_CHANNEL_ID)}</code>\n"
+        f"Destination channel: <code>{html.escape(ARCHIVE_MIRROR_CHANNEL_ID)}</code>\n"
+        f"Files to copy: <b>{len(item_keys):,}</b>\n"
+        f"Minimum estimated time: about <b>{eta_minutes:,} minutes</b> at 3 seconds per file.\n\n"
+        "Only older file posts already present in Firebase will be included. New posts will mirror automatically. "
+        "No files are copied until you confirm below.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_archive_mirror_confirmation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    token: str,
+    *,
+    cancel: bool,
+) -> None:
+    query = update.callback_query
+    if not query or not query.message:
+        return
+    if not ADMIN_ID or query.from_user.id != ADMIN_ID or query.message.chat.type != "private":
+        await query.answer("Private admin action only.", show_alert=True)
+        return
+    pending = PENDING_ARCHIVE_MIRRORS.get(token)
+    if not pending or pending.get("admin_id") != ADMIN_ID or time.time() - pending.get("created_at", 0) > 900:
+        PENDING_ARCHIVE_MIRRORS.pop(token, None)
+        await query.answer("This mirror preview expired. Run /mirror_history again.", show_alert=True)
+        return
+    if cancel:
+        PENDING_ARCHIVE_MIRRORS.pop(token, None)
+        await query.answer("Archive mirror cancelled.")
+        await query.edit_message_text(
+            "<b>ARCHIVE MIRROR CANCELLED</b>\n\nNo files were copied.",
+            parse_mode="HTML",
+        )
+        return
+    if not firebase_ready():
+        await query.answer("The Firebase catalog is unavailable.", show_alert=True)
+        return
+    item_keys = [str(key) for key in pending.get("item_keys", [])]
+    if not item_keys:
+        PENDING_ARCHIVE_MIRRORS.pop(token, None)
+        await query.answer("There are no files to copy.", show_alert=True)
+        return
+    job = {
+        "admin_id": int(ADMIN_ID),
+        "admin_message_id": int(query.message.message_id),
+        "source_channel_id": str(pending["source_channel_id"]),
+        "target_channel_id": str(pending["target_channel_id"]),
+        "item_keys": {key: True for key in item_keys},
+        "completed_items": {},
+        "failed_items": {},
+        "status": "running",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        reference = firebase_reference(f"archive_mirror_jobs/{token}")
+        saved_job = await asyncio.to_thread(
+            reference.transaction,
+            lambda current: job if current is None else current,
+        )
+    except Exception as exc:
+        logger.error("Could not persist confirmed archive mirror job (%s)", type(exc).__name__)
+        await query.answer("Could not save the mirror job. Please try again.", show_alert=True)
+        return
+    if not isinstance(saved_job, dict) or saved_job.get("created_at") != job["created_at"]:
+        PENDING_ARCHIVE_MIRRORS.pop(token, None)
+        await query.answer("This mirror job has already been started.", show_alert=True)
+        return
+    PENDING_ARCHIVE_MIRRORS.pop(token, None)
+    await query.answer("Archive mirror started.")
+    started = start_archive_mirror_job(token, context.application)
+    try:
+        await query.edit_message_text(
+            "<b>ARCHIVE MIRROR IN PROGRESS</b>\n\n"
+            f"Queued: <b>{len(item_keys):,}</b> files\n"
+            "The bot will keep at least 3 seconds between file copies. Use /mirror_status for progress.",
+            parse_mode="HTML",
+        )
+    except TelegramError as exc:
+        logger.warning("Could not update archive mirror progress preview (%s)", type(exc).__name__)
+    if not started:
+        logger.error("Archive mirror job %s is stored and will resume after service restart", token)
+
+
+def start_archive_mirror_job(token: str, application: Application | None = None) -> bool:
+    target = application or BOT_APP
+    if not target:
+        return False
+    current = ARCHIVE_MIRROR_TASKS.get(token)
+    if current and not current.done():
+        return True
+    try:
+        ARCHIVE_MIRROR_TASKS[token] = target.create_task(run_archive_mirror_job(token))
+        return True
+    except Exception as exc:
+        logger.error("Could not schedule archive mirror job (%s)", type(exc).__name__)
+        return False
+
+
+async def run_archive_mirror_job(token: str) -> None:
+    if not BOT_APP or not firebase_ready():
+        return
+    reference = firebase_reference(f"archive_mirror_jobs/{token}")
+    try:
+        job = await asyncio.to_thread(reference.get)
+    except Exception as exc:
+        logger.error("Archive mirror job read failed (%s)", type(exc).__name__)
+        return
+    if not isinstance(job, dict) or job.get("status") != "running":
+        return
+    raw_keys = job.get("item_keys", {})
+    item_keys = raw_keys if isinstance(raw_keys, dict) else {}
+    raw_completed = job.get("completed_items", {})
+    completed = dict(raw_completed) if isinstance(raw_completed, dict) else {}
+    raw_failed = job.get("failed_items", {})
+    failed = dict(raw_failed) if isinstance(raw_failed, dict) else {}
+    target = chat_reference(str(job.get("target_channel_id", ARCHIVE_MIRROR_CHANNEL_ID)))
+
+    for key in item_keys:
+        key = str(key)
+        if key in completed:
+            continue
+        try:
+            record = await get_catalog_entry(key)
+            if not isinstance(record, dict):
+                result = "missing_catalog_record"
+                failed[key] = result
+            else:
+                outcome = await archive_mirror_catalog_item(key, record, target_chat_id=target)
+                if outcome in {"copied", "already_mirrored"}:
+                    completed[key] = outcome
+                    failed.pop(key, None)
+                    await asyncio.to_thread(
+                        firebase_reference(f"archive_mirror_jobs/{token}/completed_items/{key}").set,
+                        outcome,
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            firebase_reference(f"archive_mirror_jobs/{token}/failed_items/{key}").delete
+                        )
+                    except Exception:
+                        pass
+                else:
+                    result = outcome
+                    failed[key] = result
+        except Exception as exc:
+            result = type(exc).__name__
+            failed[key] = result
+            logger.warning("Archive mirror failed for one catalog item (%s)", result)
+        if key in failed:
+            try:
+                await asyncio.to_thread(
+                    firebase_reference(f"archive_mirror_jobs/{token}/failed_items/{key}").set,
+                    failed[key],
+                )
+            except Exception as exc:
+                logger.error("Archive mirror failure progress write failed (%s)", type(exc).__name__)
+        try:
+            await asyncio.to_thread(
+                reference.update,
+                {
+                    "copied_count": sum(value == "copied" for value in completed.values()),
+                    "completed_count": len(completed),
+                    "failed_count": len(failed),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except Exception as exc:
+            logger.error("Archive mirror progress update failed (%s)", type(exc).__name__)
+            return
+
+    final_status = "completed_with_errors" if failed else "completed"
+    try:
+        await asyncio.to_thread(
+            reference.update,
+            {
+                "status": final_status,
+                "copied_count": sum(value == "copied" for value in completed.values()),
+                "completed_count": len(completed),
+                "failed_count": len(failed),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as exc:
+        logger.error("Archive mirror completion update failed (%s)", type(exc).__name__)
+        return
+    summary = (
+        "<b>ARCHIVE MIRROR COMPLETE</b>\n\n"
+        f"Copied: <b>{sum(value == 'copied' for value in completed.values()):,}</b>\n"
+        f"Already mirrored: <b>{sum(value == 'already_mirrored' for value in completed.values()):,}</b>\n"
+        f"Could not copy: <b>{len(failed):,}</b>"
+    )
+    try:
+        await BOT_APP.bot.edit_message_text(
+            chat_id=int(job.get("admin_id", ADMIN_ID)),
+            message_id=int(job["admin_message_id"]),
+            text=summary,
+            parse_mode="HTML",
+        )
+    except (TelegramError, KeyError, TypeError, ValueError) as exc:
+        logger.info("Could not update archive mirror summary (%s)", type(exc).__name__)
+
+
+async def resume_archive_mirror_jobs() -> None:
+    if not firebase_ready() or not BOT_APP:
+        return
+    try:
+        jobs = await asyncio.to_thread(firebase_reference("archive_mirror_jobs").get)
+    except Exception as exc:
+        logger.warning("Could not restore archive mirror jobs (%s)", type(exc).__name__)
+        return
+    if not isinstance(jobs, dict):
+        return
+    for token, job in jobs.items():
+        if isinstance(job, dict) and job.get("status") == "running":
+            start_archive_mirror_job(str(token), BOT_APP)
+
+
+async def archive_mirror_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user or not ADMIN_ID or user.id != ADMIN_ID:
+        return
+    if message.chat.type != "private":
+        await message.reply_text(
+            "<b>PRIVATE ADMIN ACTION</b>\n\nRun /mirror_status in the bot's private chat.",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        jobs = await asyncio.to_thread(firebase_reference("archive_mirror_jobs").get)
+    except Exception as exc:
+        logger.error("Archive mirror status read failed (%s)", type(exc).__name__)
+        await message.reply_text("<b>MIRROR STATUS UNAVAILABLE</b>\n\nPlease try again shortly.", parse_mode="HTML")
+        return
+    if not isinstance(jobs, dict) or not jobs:
+        await message.reply_text("<b>NO ARCHIVE MIRROR JOBS</b>\n\nRun /mirror_history to preview the older catalog files.", parse_mode="HTML")
+        return
+    token, job = max(jobs.items(), key=lambda item: str(item[1].get("created_at", "")) if isinstance(item[1], dict) else "")
+    if not isinstance(job, dict):
+        await message.reply_text("<b>MIRROR STATUS UNAVAILABLE</b>\n\nThe latest job record is invalid.", parse_mode="HTML")
+        return
+    total = len(job.get("item_keys", {})) if isinstance(job.get("item_keys"), dict) else 0
+    await message.reply_text(
+        "<b>ARCHIVE MIRROR STATUS</b>\n\n"
+        f"State: <b>{html.escape(str(job.get('status', 'unknown')))}</b>\n"
+        f"Copied: <b>{int(job.get('copied_count', 0) or 0):,}</b>\n"
+        f"Completed: <b>{int(job.get('completed_count', 0) or 0):,} / {total:,}</b>\n"
+        f"Could not copy: <b>{int(job.get('failed_count', 0) or 0):,}</b>\n"
+        f"Job: <code>{html.escape(str(token))}</code>",
+        parse_mode="HTML",
+    )
 
 
 async def index_channel_post(update: Update) -> None:
@@ -1131,6 +1563,17 @@ async def index_channel_post(update: Update) -> None:
     except Exception as exc:
         logger.error("Firebase write failed for one source post (%s)", type(exc).__name__)
         return
+    if ARCHIVE_MIRROR_CHANNEL_ID and archive_mirror_source_matches(record):
+        try:
+            mirror_result = await archive_mirror_catalog_item(
+                f"{message.chat.id}_{message.message_id}",
+                record,
+                bot=BOT_APP.bot if BOT_APP else None,
+            )
+            if mirror_result == "copied":
+                logger.info("Copied one authorized DB-channel file to the archive mirror")
+        except Exception as exc:
+            logger.warning("Could not copy one DB-channel file to the archive mirror (%s)", type(exc).__name__)
     if not (is_new and BOT_APP and BOT_USERNAME):
         return
     key = f"{message.chat.id}_{message.message_id}"
@@ -1679,6 +2122,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Total files: <b>{stats['total_files']:,}</b>\n"
         f"Total searches: <b>{stats['total_searches']:,}</b>\n"
         f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
+        f"Archive mirror: <b>{'Enabled' if ARCHIVE_MIRROR_SOURCE_CHANNEL_ID and ARCHIVE_MIRROR_CHANNEL_ID else 'Not configured'}</b>\n"
         f"Membership gate: <b>{'Enabled' if FORCE_JOIN_CHANNEL_ID else 'Not configured'}</b>\n"
         f"Automatic file deletion: <b>{DELETE_AFTER_SECONDS // 60} minutes</b>\n\n"
         f"<b>TOP SEARCHES</b>\n{top_text}",
@@ -2003,6 +2447,10 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await send_broadcast(update, context, data.split(":", 1)[1], cancel=False)
         elif data.startswith("broadcast_cancel:"):
             await send_broadcast(update, context, data.split(":", 1)[1], cancel=True)
+        elif data.startswith("archive_mirror_confirm:"):
+            await handle_archive_mirror_confirmation(update, context, data.split(":", 1)[1], cancel=False)
+        elif data.startswith("archive_mirror_cancel:"):
+            await handle_archive_mirror_confirmation(update, context, data.split(":", 1)[1], cancel=True)
         else:
             await update.callback_query.answer("This button is no longer available.", show_alert=True)
         return
@@ -2031,6 +2479,12 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif command == "/broadcast":
         if ADMIN_ID and user.id == ADMIN_ID:
             await prepare_broadcast(update, context, argument)
+    elif command == "/mirror_history":
+        if ADMIN_ID and user.id == ADMIN_ID:
+            await prepare_archive_mirror_history(update, context)
+    elif command == "/mirror_status":
+        if ADMIN_ID and user.id == ADMIN_ID:
+            await archive_mirror_status_command(update, context)
     elif command.startswith("/"):
         return
     else:
@@ -2154,6 +2608,8 @@ async def configure_bot(application: Application) -> None:
             BotCommand("request", "Admin: review movie requests"),
             BotCommand("requests", "Admin: review movie requests"),
             BotCommand("broadcast", "Admin: prepare a confirmed broadcast"),
+            BotCommand("mirror_history", "Admin: preview old DB files for archive mirror"),
+            BotCommand("mirror_status", "Admin: check archive mirror progress"),
         ]
     )
     if RENDER_EXTERNAL_URL:
@@ -2181,6 +2637,7 @@ async def lifespan(application: FastAPI):
         await configure_bot(BOT_APP)
         await restore_pending_deletions()
         await resume_broadcast_jobs()
+        await resume_archive_mirror_jobs()
     else:
         logger.warning("BOT_TOKEN is missing; bot commands and channel indexing are disabled")
     yield

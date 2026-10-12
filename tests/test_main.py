@@ -266,6 +266,158 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_archive_mirror_candidates_only_include_unmirrored_files_from_db_source(self):
+        catalog = {
+            "-1004443404016_20": {
+                "source_chat_id": -1004443404016,
+                "source_message_id": 20,
+                "file_name": "Later.mkv",
+            },
+            "-1004443404016_10": {
+                "source_chat_id": -1004443404016,
+                "source_message_id": 10,
+                "file_name": "Earlier.mkv",
+            },
+            "-1004443404016_5": {
+                "source_chat_id": -1004443404016,
+                "source_message_id": 5,
+                "archive_mirror_target_chat_id": "-1003942606485",
+                "archive_mirror_target_message_id": 300,
+            },
+            "-1004443404020_8": {
+                "source_chat_id": -1004443404020,
+                "source_message_id": 8,
+                "file_name": "Other channel.mkv",
+            },
+        }
+
+        async def run():
+            with patch.object(main, "ARCHIVE_MIRROR_SOURCE_CHANNEL_ID", "-1004443404016"), patch.object(
+                main, "ARCHIVE_MIRROR_CHANNEL_ID", "-1003942606485"
+            ), patch.object(main, "get_catalog", new=AsyncMock(return_value=catalog)):
+                self.assertEqual(
+                    await main.archive_mirror_candidate_keys(),
+                    ["-1004443404016_10", "-1004443404016_20"],
+                )
+
+        asyncio.run(run())
+
+    def test_new_db_upload_is_auto_mirrored_once_and_persists_receipt(self):
+        chat = SimpleNamespace(id=-1004443404016, title="DB archive", username=None)
+        post = SimpleNamespace(chat=chat, message_id=88)
+        update = SimpleNamespace(channel_post=post)
+        copied_message = SimpleNamespace(message_id=900)
+        bot = SimpleNamespace(copy_message=AsyncMock(return_value=copied_message))
+        application = SimpleNamespace(bot=bot)
+        details = {"file_name": "Movie.mkv", "file_size": 1024, "media_type": "document"}
+        record_store = {
+            **details,
+            "source_chat_id": -1004443404016,
+            "source_message_id": 88,
+        }
+
+        async def get_entry(key):
+            return dict(record_store)
+
+        async def save_entry(key, record):
+            record_store.update(record)
+
+        async def run():
+            with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016}), patch.object(
+                main, "ARCHIVE_MIRROR_SOURCE_CHANNEL_ID", "-1004443404016"
+            ), patch.object(main, "ARCHIVE_MIRROR_CHANNEL_ID", "-1003942606485"), patch.object(
+                main, "ARCHIVE_MIRROR_LOCKS", {}
+            ), patch.object(main, "ARCHIVE_MIRROR_SEND_LOCK", asyncio.Lock()), patch.object(
+                main, "ARCHIVE_MIRROR_LAST_SENT_AT", 0.0
+            ), patch.object(main, "BOT_APP", application), patch.object(
+                main, "BOT_USERNAME", "mf_movie_library_bot"
+            ), patch.object(main, "firebase_ready", return_value=True), patch.object(
+                main, "extract_media_details", return_value=details
+            ), patch.object(main, "save_new_media_post", new=AsyncMock(side_effect=[True, False])), patch.object(
+                main, "get_catalog_entry", new=AsyncMock(side_effect=get_entry)
+            ), patch.object(main, "save_catalog_entry", new=AsyncMock(side_effect=save_entry)), patch.object(
+                main, "movie_announcement_destinations", return_value=[]
+            ):
+                await main.index_channel_post(update)
+                await main.index_channel_post(update)
+
+        asyncio.run(run())
+        bot.copy_message.assert_awaited_once_with(
+            chat_id=-1003942606485,
+            from_chat_id=-1004443404016,
+            message_id=88,
+        )
+        self.assertEqual(record_store["archive_mirror_target_chat_id"], "-1003942606485")
+        self.assertEqual(record_store["archive_mirror_target_message_id"], 900)
+
+    def test_archive_mirror_waits_for_three_seconds_between_sends(self):
+        record = {"source_chat_id": -1004443404016, "source_message_id": 88}
+        bot = SimpleNamespace(copy_message=AsyncMock(return_value=SimpleNamespace(message_id=900)))
+
+        async def run():
+            with patch.object(main, "ARCHIVE_MIRROR_SOURCE_CHANNEL_ID", "-1004443404016"), patch.object(
+                main, "ARCHIVE_MIRROR_CHANNEL_ID", "-1003942606485"
+            ), patch.object(main, "ARCHIVE_MIRROR_LOCKS", {}), patch.object(
+                main, "ARCHIVE_MIRROR_SEND_LOCK", asyncio.Lock()
+            ), patch.object(main, "ARCHIVE_MIRROR_DELAY_SECONDS", 3.0), patch.object(
+                main, "ARCHIVE_MIRROR_LAST_SENT_AT", time.monotonic() - 1.0
+            ), patch.object(main, "get_catalog_entry", new=AsyncMock(return_value=record)), patch.object(
+                main, "save_catalog_entry", new=AsyncMock()
+            ), patch.object(main.asyncio, "sleep", new=AsyncMock()) as sleep:
+                result = await main.archive_mirror_catalog_item("-1004443404016_88", record, bot=bot)
+                self.assertEqual(result, "copied")
+                delay = sleep.await_args.args[0]
+                self.assertGreater(delay, 1.9)
+                self.assertLessEqual(delay, 2.0)
+
+        asyncio.run(run())
+
+    def test_admin_archive_mirror_preview_requires_confirmation_and_persists_job(self):
+        tree = {}
+        user = SimpleNamespace(id=77)
+        message = SimpleNamespace(chat=SimpleNamespace(type="private"), reply_text=AsyncMock())
+        update = SimpleNamespace(effective_message=message, effective_user=user)
+        context = SimpleNamespace(application=SimpleNamespace())
+
+        async def run():
+            with patch.object(main, "ADMIN_ID", 77), patch.object(
+                main, "ARCHIVE_MIRROR_SOURCE_CHANNEL_ID", "-1004443404016"
+            ), patch.object(main, "ARCHIVE_MIRROR_CHANNEL_ID", "-1003942606485"), patch.object(
+                main, "PENDING_ARCHIVE_MIRRORS", {}
+            ), patch.object(main, "new_session_token", return_value="mirror-token"), patch.object(
+                main, "archive_mirror_candidate_keys", new=AsyncMock(return_value=["-1004443404016_10", "-1004443404016_20"])
+            ), patch.object(main, "firebase_ready", return_value=True):
+                await main.prepare_archive_mirror_history(update, context)
+                preview = message.reply_text.await_args.args[0]
+                self.assertIn("Files to copy: <b>2</b>", preview)
+                self.assertIn("3 seconds per file", preview)
+                button = message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0]
+                self.assertEqual(button.text, "Confirm mirror")
+                self.assertTrue(button.callback_data.startswith("archive_mirror_confirm:"))
+
+                query = SimpleNamespace(
+                    from_user=user,
+                    message=SimpleNamespace(chat=SimpleNamespace(type="private"), message_id=456),
+                    answer=AsyncMock(),
+                    edit_message_text=AsyncMock(),
+                )
+                callback_update = SimpleNamespace(callback_query=query)
+                app_context = SimpleNamespace(application=SimpleNamespace())
+                with patch.object(main, "firebase_ready", return_value=True), patch.object(
+                    main, "firebase_reference", side_effect=lambda path: FakeTreeReference(tree, path)
+                ), patch.object(main, "start_archive_mirror_job", return_value=True) as start_job:
+                    await main.handle_archive_mirror_confirmation(
+                        callback_update, app_context, "mirror-token", cancel=False
+                    )
+                    start_job.assert_called_once_with("mirror-token", app_context.application)
+
+            job = tree["archive_mirror_jobs"]["mirror-token"]
+            self.assertEqual(job["status"], "running")
+            self.assertEqual(len(job["item_keys"]), 2)
+            self.assertEqual(job["target_channel_id"], "-1003942606485")
+
+        asyncio.run(run())
+
     def test_group_search_returns_bot_deep_link_results_without_registering_group_user(self):
         message = SimpleNamespace(
             chat=SimpleNamespace(type="supergroup"),
@@ -428,6 +580,15 @@ class SearchAndMediaTests(unittest.TestCase):
             self.assertIsNone(wrong_user_token)
 
         asyncio.run(run())
+
+    def test_movie_request_link_parser_accepts_underscores_inside_signature(self):
+        payload = "r25_abc123_abcde_fghij"
+        with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
+            main,
+            "MOVIE_REQUEST_SESSIONS",
+            {"abc123": {"user_id": 77, "created_at": time.time()}},
+        ), patch.object(main, "make_file_payload_signature", return_value="abcde_fghij"):
+            self.assertEqual(main.movie_request_token_from_start_payload(payload, 77), "abc123")
 
     def test_group_request_start_persists_request_for_the_button_user(self):
         tree = {}
