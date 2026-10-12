@@ -85,6 +85,7 @@ MAIN_CHANNEL_ID = os.getenv("MAIN_CHANNEL_ID", "").strip() or os.getenv("FORCE_J
 MAIN_CHANNEL_URL = "https://t.me/mfmainchannel"
 MAIN_CHANNEL_HANDLE = "@mfmainchannel"
 DELIVERY_BOT_HANDLE = "@mf_movie_bot"
+INSTAGRAM_URL = "https://www.instagram.com/mallu.film.ott.updates?cplk=MXdhZHh5YjMzYXViNw=="
 MOVIE_REQUEST_GROUP_URL = "https://t.me/MFMovieandSeriesRequestGroup"
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
@@ -385,28 +386,30 @@ def delivered_file_caption(record: dict[str, Any], bot=None) -> tuple[str, list[
     source_caption = record.get("caption")
     if not isinstance(source_caption, str) or not source_caption.strip():
         source_caption = str(record.get("file_name") or "Movie file")
-    footer = (
-        f"Main channel: {MAIN_CHANNEL_HANDLE}\n"
-        f"Bot: {DELIVERY_BOT_HANDLE}\n"
-        "Auto-deletes in 10 minutes."
-    )
+    instagram_prefix = f"Main channel: {MAIN_CHANNEL_HANDLE}\nBot: {DELIVERY_BOT_HANDLE}\n"
+    footer = f"{instagram_prefix}Instagram\nAuto-deletes in 10 minutes."
     separator = "\n\n"
     source_budget = 1024 - _utf16_units(separator + footer)
     truncated = _utf16_units(source_caption) > source_budget
     if truncated:
         source_caption = _truncate_utf16(source_caption, max(0, source_budget - 1)).rstrip() + "…"
     caption = f"{source_caption}{separator}{footer}"
+    instagram_entity = MessageEntity(
+        type=MessageEntity.TEXT_LINK,
+        offset=_utf16_units(source_caption + separator + instagram_prefix),
+        length=_utf16_units("Instagram"),
+        url=INSTAGRAM_URL,
+    )
     if truncated:
-        return caption, None
+        return caption, [instagram_entity]
     raw_entities = record.get("caption_entities")
-    if not isinstance(raw_entities, list):
-        return caption, None
     entities = [
         MessageEntity.de_json(entity, bot)
         for entity in raw_entities
         if isinstance(entity, dict)
-    ]
-    return caption, entities or None
+    ] if isinstance(raw_entities, list) else []
+    entities.append(instagram_entity)
+    return caption, entities
 
 
 def keyboard_button(text: str, *, callback_data: str | None = None, url: str | None = None, style: str = "success") -> InlineKeyboardButton:
@@ -870,7 +873,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
     await message.reply_text(
         "<b>MF MOVIE LIBRARY</b>\n"
         "<i>Your archive, beautifully within reach.</i>\n\n"
-        f'<a href="{MAIN_CHANNEL_URL}">Join our main channel for updates</a> (optional).\n\n'
+        f'<a href="{MAIN_CHANNEL_URL}">Join our main channel for updates</a> (optional) · '
+        f'<a href="{INSTAGRAM_URL}">Instagram</a>.\n\n'
         "<b>Search</b>\n"
         "Send a movie title or filename as a regular message. Browse results with Next and Back, then choose a file.\n"
         "Send /latest to browse the newest additions.\n\n"

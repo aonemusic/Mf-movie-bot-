@@ -99,6 +99,7 @@ class SearchAndMediaTests(unittest.TestCase):
         welcome = message.reply_text.await_args.args[0]
         self.assertIn(main.MAIN_CHANNEL_URL, welcome)
         self.assertIn("(optional)", welcome)
+        self.assertIn(f'<a href="{main.INSTAGRAM_URL}">Instagram</a>', welcome)
 
     def test_file_size_formatting(self):
         self.assertEqual(main.format_file_size(0), "Size unknown")
@@ -118,6 +119,12 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertIn("Auto-deletes in 10 minutes.", caption)
         self.assertEqual(entities[0].type, "bold")
         self.assertEqual((entities[0].offset, entities[0].length), (0, 8))
+        self.assertEqual(entities[-1].type, "text_link")
+        self.assertEqual(entities[-1].url, main.INSTAGRAM_URL)
+        self.assertEqual(
+            entities[-1].offset,
+            main._utf16_units(caption[: caption.index("Instagram")]),
+        )
 
     def test_delivered_file_caption_preserves_footer_when_source_caption_is_too_long(self):
         caption, entities = main.delivered_file_caption(
@@ -126,7 +133,9 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertLessEqual(main._utf16_units(caption), 1024)
         self.assertIn("Main channel: @mfmainchannel", caption)
         self.assertIn("Bot: @mf_movie_bot", caption)
-        self.assertIsNone(entities)
+        self.assertEqual(len(entities), 1)
+        self.assertEqual(entities[0].type, "text_link")
+        self.assertEqual(entities[0].url, main.INSTAGRAM_URL)
 
     def test_backup_source_is_added_without_replacing_existing_sources(self):
         self.assertEqual(
