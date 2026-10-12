@@ -16,10 +16,6 @@ services:
         sync: false
       - key: FILE_BACKUP_CHANNEL_ID
         sync: false
-      - key: ARCHIVE_MIRROR_SOURCE_CHANNEL_ID
-        sync: false
-      - key: ARCHIVE_MIRROR_CHANNEL_ID
-        sync: false
       - key: MOVIE_ANNOUNCEMENT_CHANNELS
         sync: false
       - key: FORCE_JOIN_CHANNEL_ID

@@ -1,13 +1,11 @@
 # MF Movie Library Bot
 
-A Telegram Bot API application for an authorized movie archive. It indexes new media posts from configured Telegram source channels into Firebase Realtime Database, supports plain-text movie searches, and delivers selected files privately. An admin can preview and confirm a backfill of older DB-channel posts already present in Firebase.
+A Telegram Bot API application for an authorized movie archive. It indexes new media posts from configured Telegram source channels into Firebase Realtime Database, supports plain-text movie searches, and delivers selected files privately. It does not import old channel history automatically.
 
 ## Features
 
 - New source-channel media is indexed in Firebase with its title/filename, type, size, source IDs, source link where available, and timestamp. Media bytes remain in Telegram; they are not downloaded to Render or Firebase.
 - `FILE_BACKUP_CHANNEL_ID` is an optional additional archive source. It is added alongside (not instead of) `TELEGRAM_SOURCE_CHATS`.
-- New media posts from `ARCHIVE_MIRROR_SOURCE_CHANNEL_ID` are copied into `ARCHIVE_MIRROR_CHANNEL_ID` as a plan-B archive. Mirror copies are rate-limited to at least three seconds apart and marked in Firebase so repeat updates do not normally duplicate them. The admin can use `/mirror_history` to preview old eligible catalog records and confirm a resumable backfill; `/mirror_status` reports job progress.
-- Backfill can only use channel/message IDs already indexed in Firebase. Telegram's Bot API cannot enumerate earlier source-channel history, so records absent from the catalog cannot be backfilled automatically. Posts the Bot API cannot copy (including protected content) are reported as failures rather than bypassed.
 - Each newly uploaded media post in a configured source channel is indexed and announced once in every resolved configured source channel, every channel listed separately in `MOVIE_ANNOUNCEMENT_CHANNELS`, and `FORCE_JOIN_CHANNEL_ID` (the main channel), as a clean English filename/size post with a **Get File** button. The button opens a signed bot link; users must have started the bot privately to receive the file. Duplicate Telegram updates do not create duplicate announcements. Telegram does not provide the bot with a list of every channel where it is an admin, so source channels must be configured separately from announcement-only destinations.
 - Users send a movie title or filename as an ordinary message in private chat or in a group. Search ranks exact title/filename matches ahead of broader matches, then uses upload time to break ties. `/latest` browses the newest catalog additions. Group results use secure bot deep links: tapping a file opens the bot and delivers the selected item privately after the user starts the bot. Results show up to ten blue file buttons per page with green Next and Back navigation; channel links are not shown beside search results. Group result and request buttons are removed after five minutes; navigating to another result page restarts that page's timer. Typing indicators appear in the group where the search is made.
 - If no result is found, a user can request the movie in private or group search. The group button opens a signed link to the bot; pressing **Start** submits the request privately. The admin reviews open requests using `/requests` (or `/request`) and marks a request as added after uploading the file. The bot then notifies every requester to search again.
@@ -26,8 +24,6 @@ Add values in the Render service's **Environment**. Never commit secrets or past
 | `ADMIN_ID` | Yes | Numeric Telegram user ID permitted to view stats, review requests, and prepare broadcasts. |
 | `TELEGRAM_SOURCE_CHATS` | Yes | Comma-separated Telegram channel IDs or usernames whose new posts should be indexed. |
 | `FILE_BACKUP_CHANNEL_ID` | No | One extra file-backup/archive channel ID, added to `TELEGRAM_SOURCE_CHATS` without replacing its list. |
-| `ARCHIVE_MIRROR_SOURCE_CHANNEL_ID` | No | The DB/archive source channel whose media should be copied to the plan-B archive; defaults to `FILE_BACKUP_CHANNEL_ID`. |
-| `ARCHIVE_MIRROR_CHANNEL_ID` | No | Destination channel ID for automatic new-file copies and admin-confirmed historical backfills. The bot must be an administrator there. |
 | `MOVIE_ANNOUNCEMENT_CHANNELS` | No | Comma-separated announcement-only channel IDs or usernames. These receive new-movie posts but are not indexed as upload sources. |
 | `FIREBASE_DATABASE_URL` | Yes | Realtime Database URL. |
 | `FIREBASE_PROJECT_ID` | Recommended | Firebase project ID. |
@@ -44,12 +40,11 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 ## Telegram setup
 
 1. Set the environment variables above in Render. This version uses the Telegram Bot API only; `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `TELEGRAM_SESSION_STRING` are not needed.
-2. Add the bot as an administrator in each source and announcement channel so Telegram sends it `channel_post` updates and allows it to post. List upload sources in `TELEGRAM_SOURCE_CHATS` and/or `FILE_BACKUP_CHANNEL_ID`; list announcement-only destinations in `MOVIE_ANNOUNCEMENT_CHANNELS`. For plan-B archiving, also make it an administrator in `ARCHIVE_MIRROR_CHANNEL_ID` and set the mirror source/target environment variables.
+2. Add the bot as an administrator in each source and announcement channel so Telegram sends it `channel_post` updates and allows it to post. List upload sources in `TELEGRAM_SOURCE_CHATS` and/or `FILE_BACKUP_CHANNEL_ID`; list announcement-only destinations in `MOVIE_ANNOUNCEMENT_CHANNELS`.
 3. Add the bot as an administrator in the main/force-join channel so it can post new-file announcements and reliably verify membership. For a private channel, set a valid `FORCE_JOIN_CHANNEL_URL` invite link.
 4. Add the bot as an administrator in each group where it should read ordinary movie-title messages. Alternatively, disable the bot's group privacy mode in BotFather. Users can also search in groups by sending `/search Movie Name`.
 5. Open the bot and send `/start` as the configured admin. A user must press **Start** in the bot the first time a group file link opens; Telegram does not allow bots to initiate private chats. Users must start or interact with the bot before it can receive broadcasts.
 6. Add new authorized media posts to any configured source channel. The bot indexes each new post and publishes a filename/size announcement with a **Get File** button in every configured source channel, every `MOVIE_ANNOUNCEMENT_CHANNELS` destination, and the main channel.
-7. To backfill older DB-channel files that are already in Firebase, run `/mirror_history` in the private admin chat. Review the source, destination, file count, and estimated duration, then press **Confirm mirror**. The copy job resumes after service restarts; `/mirror_status` shows its progress.
 
 ## User and admin commands
 
@@ -61,8 +56,6 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 - If a title has no matches, select **Request this movie**. In a group, the button opens the bot privately; press **Start** to submit. The admin receives a notice and can manage the request queue with `/requests` or `/request`.
 - `/status` or `/stuts` — admin only; displays unique users who have started the bot privately or searched in a group, total indexed files, total searches, and top searches. Group-only users are analytics-only and cannot receive direct-message broadcasts until they start the bot privately.
 - `/broadcast Your message` — admin only; text-only broadcasts (up to 3,200 characters) are ready now: the bot previews the message and requires a confirmation button before sending. Image/media broadcasts are optional and are not required.
-- `/mirror_history` — admin only, private chat; preview unmirrored DB-channel entries already indexed in Firebase, then confirm before the old files are copied at least three seconds apart.
-- `/mirror_status` — admin only; show the newest archive-mirror backfill state, progress, and up to three Telegram copy failure details.
 - `/healthz` — public, secret-free readiness check for Render. Returns HTTP 200 only when the bot, Firebase, at least one source channel, and force-join configuration are ready; returns HTTP 503 otherwise.
 
 Render Free services may sleep or restart. Firebase stores the searchable catalog, analytics, user IDs needed for bot messaging, request records, and pending delivery deletions; it does not store the actual media files. Telegram remains the source of media. Users need access to a source post for the bot to copy it successfully.
