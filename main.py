@@ -81,8 +81,7 @@ MOVIE_ANNOUNCEMENT_CHANNELS = [
     for item in os.getenv("MOVIE_ANNOUNCEMENT_CHANNELS", "").split(",")
     if item.strip()
 ]
-FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
-FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip()
+MAIN_CHANNEL_ID = os.getenv("MAIN_CHANNEL_ID", "").strip() or os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 MAIN_CHANNEL_URL = "https://t.me/mfmainchannel"
 MAIN_CHANNEL_HANDLE = "@mfmainchannel"
 DELIVERY_BOT_HANDLE = "@mf_movie_bot"
@@ -353,8 +352,8 @@ def movie_announcement_destinations() -> list[int | str]:
     """Return all configured source, extra announcement and main channels once each."""
     destinations: list[int | str] = sorted(SOURCE_CHANNEL_IDS)
     destinations.extend(chat_reference(item) for item in MOVIE_ANNOUNCEMENT_CHANNELS)
-    if FORCE_JOIN_CHANNEL_ID:
-        destinations.append(chat_reference(FORCE_JOIN_CHANNEL_ID))
+    if MAIN_CHANNEL_ID:
+        destinations.append(chat_reference(MAIN_CHANNEL_ID))
     unique: list[int | str] = []
     seen: set[str] = set()
     for destination in destinations:
@@ -824,50 +823,6 @@ def no_results_keyboard(user_id: int, title: str, *, group: bool = False) -> Inl
     )
 
 
-async def is_user_member(bot, user_id: int) -> bool:
-    if not FORCE_JOIN_CHANNEL_ID:
-        return False
-    try:
-        member = await bot.get_chat_member(chat_id=chat_reference(FORCE_JOIN_CHANNEL_ID), user_id=user_id)
-        return member.status in {"member", "administrator", "creator"} or (
-            member.status == "restricted" and bool(getattr(member, "is_member", False))
-        )
-    except TelegramError as exc:
-        logger.warning("Force-join membership check failed (%s)", type(exc).__name__)
-        return False
-
-
-async def force_join_keyboard(bot) -> InlineKeyboardMarkup | None:
-    url = FORCE_JOIN_CHANNEL_URL
-    if not url and FORCE_JOIN_CHANNEL_ID.startswith("@"):
-        url = f"https://t.me/{FORCE_JOIN_CHANNEL_ID[1:]}"
-    if not url:
-        try:
-            channel = await bot.get_chat(chat_id=chat_reference(FORCE_JOIN_CHANNEL_ID))
-            if channel.username:
-                url = f"https://t.me/{channel.username}"
-        except TelegramError:
-            pass
-    if not url:
-        return None
-    return InlineKeyboardMarkup([[keyboard_button("Join channel to unlock", url=url)]])
-
-
-async def send_join_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message:
-        return
-    keyboard = await force_join_keyboard(context.bot)
-    text = (
-        "<b>MEMBERSHIP REQUIRED</b>\n\n"
-        "Join our channel to unlock the movie catalog. Once you have joined, send your movie title again "
-        "or tap your selected file button one more time."
-    )
-    if not keyboard:
-        text += "\n\n<i>The channel link is not configured yet. Please contact the bot administrator.</i>"
-    await message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
-
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str = "") -> None:
     message = update.effective_message
     user = update.effective_user
@@ -892,12 +847,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
                         "If it is added, you will receive a message here.",
                         parse_mode="HTML",
                     )
-                elif status == "membership":
-                    await message.reply_text(
-                        "<b>MEMBERSHIP REQUIRED</b>\n\nJoin our channel, then open your movie request link again.",
-                        parse_mode="HTML",
-                        reply_markup=keyboard,
-                    )
                 elif status == "expired":
                     await message.reply_text(
                         "<b>REQUEST LINK EXPIRED</b>\n\nSearch for the movie again and tap its request button.",
@@ -916,21 +865,12 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
                     parse_mode="HTML",
                 )
                 return
-            if not FORCE_JOIN_CHANNEL_ID or not await is_user_member(context.bot, user.id):
-                join_keyboard = await force_join_keyboard(context.bot)
-                rows = join_keyboard.inline_keyboard if join_keyboard else []
-                rows.append([keyboard_button("I have joined — send my file", callback_data=f"file:{key}")])
-                await message.reply_text(
-                    "<b>ONE LAST STEP</b>\n\nJoin our channel, then tap the button below to receive your selected file.",
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(rows),
-                )
-                return
             await deliver_group_file(update, context, key)
             return
     await message.reply_text(
         "<b>MF MOVIE LIBRARY</b>\n"
         "<i>Your archive, beautifully within reach.</i>\n\n"
+        f'<a href="{MAIN_CHANNEL_URL}">Join our main channel for updates</a> (optional).\n\n'
         "<b>Search</b>\n"
         "Send a movie title or filename as a regular message. Browse results with Next and Back, then choose a file.\n"
         "Send /latest to browse the newest additions.\n\n"
@@ -994,15 +934,6 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
     await send_chat_action(context.bot, message.chat_id, "typing")
     if is_private:
         await register_user(user)
-    if not FORCE_JOIN_CHANNEL_ID:
-        await message.reply_text(
-            "<b>CATALOG TEMPORARILY UNAVAILABLE</b>\n\nThe membership channel has not been configured yet. Please try again later.",
-            parse_mode="HTML",
-        )
-        return
-    if not await is_user_member(context.bot, user.id):
-        await send_join_prompt(update, context)
-        return
     query_text = query_text.strip()
     if len(query_text) < 2:
         await message.reply_text(
@@ -1074,15 +1005,6 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await send_chat_action(context.bot, message.chat_id, "typing")
     if is_private:
         await register_user(user)
-    if not FORCE_JOIN_CHANNEL_ID:
-        await message.reply_text(
-            "<b>CATALOG TEMPORARILY UNAVAILABLE</b>\n\nThe membership channel has not been configured yet. Please try again later.",
-            parse_mode="HTML",
-        )
-        return
-    if not await is_user_member(context.bot, user.id):
-        await send_join_prompt(update, context)
-        return
     if not firebase_ready():
         await message.reply_text(
             "<b>CATALOG SYNC IN PROGRESS</b>\n\nPlease try again shortly.",
@@ -1331,23 +1253,6 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not re.fullmatch(r"-?\d{1,19}_\d{1,20}", key):
         await query.answer("That file selection is invalid. Please search again.", show_alert=True)
         return
-    if not FORCE_JOIN_CHANNEL_ID or not await is_user_member(context.bot, query.from_user.id):
-        await query.answer("Join our required channel to unlock this file.", show_alert=True)
-        keyboard = await force_join_keyboard(context.bot)
-        if keyboard:
-            await context.bot.send_message(
-                chat_id=query.from_user.id,
-                text="<b>ONE LAST STEP</b>\n\nJoin the channel, then tap your selected file button again.",
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=query.from_user.id,
-                text="<b>CHANNEL LINK UNAVAILABLE</b>\n\nPlease contact the bot administrator for access.",
-                parse_mode="HTML",
-            )
-        return
     if not firebase_ready():
         await query.answer("The catalog is not ready yet. Please try again shortly.", show_alert=True)
         return
@@ -1434,8 +1339,6 @@ async def submit_movie_request(bot, user, token: str) -> tuple[str, str, InlineK
         MOVIE_REQUEST_SESSIONS.pop(token, None)
         return "expired", "", None
     title = str(request_session["title"])
-    if not FORCE_JOIN_CHANNEL_ID or not await is_user_member(bot, user.id):
-        return "membership", title, await force_join_keyboard(bot)
     if not firebase_ready():
         return "unavailable", title, None
 
@@ -1501,15 +1404,6 @@ async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_T
             "If it is added, you will receive a message here.",
             parse_mode="HTML",
         )
-    elif status == "membership":
-        await query.answer("Join our required channel before sending a request.", show_alert=True)
-        if keyboard:
-            await context.bot.send_message(
-                chat_id=query.from_user.id,
-                text="<b>MEMBERSHIP REQUIRED</b>\n\nJoin the channel, then tap your request button again.",
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
     else:
         await query.answer(
             "This request link has expired. Search again." if status == "expired"
@@ -1682,7 +1576,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "<b>MF MOVIE LIBRARY · LIVE STATUS</b>\n\n"
             "Realtime Database: <b>Not ready</b>\n"
             f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
-            f"Membership gate: <b>{'Enabled' if FORCE_JOIN_CHANNEL_ID else 'Not configured'}</b>",
+            f'Channel membership: <b>Optional</b> · <a href="{MAIN_CHANNEL_URL}">@mfmainchannel</a>',
             parse_mode="HTML",
         )
         return
@@ -1707,7 +1601,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Total files: <b>{stats['total_files']:,}</b>\n"
         f"Total searches: <b>{stats['total_searches']:,}</b>\n"
         f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
-        f"Membership gate: <b>{'Enabled' if FORCE_JOIN_CHANNEL_ID else 'Not configured'}</b>\n"
+        f'Channel membership: <b>Optional</b> · <a href="{MAIN_CHANNEL_URL}">@mfmainchannel</a>\n'
         f"Automatic file deletion: <b>{DELETE_AFTER_SECONDS // 60} minutes</b>\n\n"
         f"<b>TOP SEARCHES</b>\n{top_text}",
         parse_mode="HTML",
@@ -2090,17 +1984,6 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     ):
         await query.answer("This results page has expired. Search again.", show_alert=True)
         return
-    if not await is_user_member(context.bot, query.from_user.id):
-        await query.answer("Join our required channel to unlock the catalog.", show_alert=True)
-        keyboard = await force_join_keyboard(context.bot)
-        if keyboard:
-            await context.bot.send_message(
-                chat_id=query.from_user.id,
-                text="<b>MEMBERSHIP REQUIRED</b>\n\nJoin the channel, then tap Next or Back again.",
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-        return
     await query.answer()
     await send_chat_action(context.bot, query.message.chat_id, "typing")
     is_latest = session.get("mode") == "latest"
@@ -2247,7 +2130,7 @@ async def healthz():
         "firebase_ready": firebase_ready(),
         "source_channels_configured": bool(TELEGRAM_SOURCE_CHATS),
         "source_channels_resolved": len(SOURCE_CHANNEL_IDS),
-        "force_join_configured": bool(FORCE_JOIN_CHANNEL_ID),
+        "main_channel_configured": bool(MAIN_CHANNEL_ID),
         "search_result_limit": MAX_SEARCH_RESULTS,
         "delete_after_minutes": DELETE_AFTER_SECONDS // 60,
     }
@@ -2257,7 +2140,6 @@ async def healthz():
         and status["firebase_ready"]
         and status["source_channels_configured"]
         and status["source_channels_resolved"] > 0
-        and status["force_join_configured"]
     )
     status["ok"] = ready
     if not ready:

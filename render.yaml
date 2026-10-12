@@ -18,9 +18,7 @@ services:
         sync: false
       - key: MOVIE_ANNOUNCEMENT_CHANNELS
         sync: false
-      - key: FORCE_JOIN_CHANNEL_ID
-        sync: false
-      - key: FORCE_JOIN_CHANNEL_URL
+      - key: MAIN_CHANNEL_ID
         sync: false
       - key: FIREBASE_DATABASE_URL
         sync: false

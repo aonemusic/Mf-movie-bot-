@@ -87,6 +87,19 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertEqual(details["file_size"], 100)
         self.assertEqual(details["file_name"], "Film poster")
 
+    def test_start_welcome_keeps_main_channel_link_optional(self):
+        message = SimpleNamespace(
+            chat=SimpleNamespace(type="private"),
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(effective_message=message, effective_user=None)
+
+        asyncio.run(main.start_command(update, SimpleNamespace(bot=None)))
+
+        welcome = message.reply_text.await_args.args[0]
+        self.assertIn(main.MAIN_CHANNEL_URL, welcome)
+        self.assertIn("(optional)", welcome)
+
     def test_file_size_formatting(self):
         self.assertEqual(main.format_file_size(0), "Size unknown")
         self.assertEqual(main.format_file_size(1024 * 1024), "1.0 MB")
@@ -256,7 +269,7 @@ class SearchAndMediaTests(unittest.TestCase):
             with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016, -1004443404020}), patch.object(
                 main, "MOVIE_ANNOUNCEMENT_CHANNELS", ["-1003391211397"]
             ), patch.object(
-                main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
+                main, "MAIN_CHANNEL_ID", "-1004352245988"
             ), patch.object(main, "BOT_APP", application), patch.object(
                 main, "BOT_USERNAME", "mf_movie_library_bot"
             ), patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
@@ -279,7 +292,7 @@ class SearchAndMediaTests(unittest.TestCase):
             with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016, -1004443404020}), patch.object(
                 main, "MOVIE_ANNOUNCEMENT_CHANNELS", ["-1003391211397"]
             ), patch.object(
-                main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
+                main, "MAIN_CHANNEL_ID", "-1004352245988"
             ), patch.object(main, "BOT_APP", application), patch.object(
                 main, "BOT_USERNAME", "mf_movie_library_bot"
             ), patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
@@ -305,12 +318,12 @@ class SearchAndMediaTests(unittest.TestCase):
             with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
                 main, "BOT_USERNAME", "mf_movie_library_bot"
             ), patch.object(
-                main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
+                main, "MAIN_CHANNEL_ID", ""
             ), patch.object(main, "send_chat_action", new=AsyncMock()) as chat_action, patch.object(
                 main, "schedule_group_result_keyboard_removal", new=Mock()
             ) as cleanup, patch.object(
                 main, "register_user", new=AsyncMock()
-            ) as register, patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+            ) as register, patch.object(
                 main, "firebase_ready", return_value=True
             ), patch.object(main, "record_active_user", new=AsyncMock()) as active_user, patch.object(
                 main, "record_search", new=AsyncMock()
@@ -355,9 +368,9 @@ class SearchAndMediaTests(unittest.TestCase):
         async def run():
             with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
                 main, "BOT_USERNAME", "mf_movie_library_bot"
-            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1002"), patch.object(
+            ), patch.object(main, "MAIN_CHANNEL_ID", ""), patch.object(
                 main, "send_chat_action", new=AsyncMock()
-            ) as typing, patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+            ) as typing, patch.object(
                 main, "firebase_ready", return_value=True
             ), patch.object(main, "record_active_user", new=AsyncMock()), patch.object(
                 main, "register_user", new=AsyncMock()
@@ -388,7 +401,7 @@ class SearchAndMediaTests(unittest.TestCase):
             page_update = SimpleNamespace(callback_query=query)
             with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
                 main, "BOT_USERNAME", "mf_movie_library_bot"
-            ), patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+            ), patch.object(main, "MAIN_CHANNEL_ID", ""), patch.object(
                 main, "send_chat_action", new=AsyncMock()
             ) as page_typing, patch.object(main, "latest_catalog", new=AsyncMock(return_value=movies)), patch.object(main, "schedule_group_result_keyboard_removal", new=Mock()) as page_cleanup:
                 await main.search_page_callback(page_update, context)
@@ -430,10 +443,9 @@ class SearchAndMediaTests(unittest.TestCase):
         async def run():
             with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
                 main, "BOT_USERNAME", "mf_movie_library_bot"
-            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"), patch.object(
+            ), patch.object(main, "MAIN_CHANNEL_ID", ""), patch.object(
                 main, "send_chat_action", new=AsyncMock()
             ), patch.object(main, "schedule_group_result_keyboard_removal", new=Mock()) as cleanup, patch.object(
-                main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
                 main, "firebase_ready", return_value=True
             ), patch.object(main, "record_active_user", new=AsyncMock()), patch.object(
                 main, "record_search", new=AsyncMock()
@@ -476,8 +488,8 @@ class SearchAndMediaTests(unittest.TestCase):
                 main, "BOT_USERNAME", "mf_movie_library_bot"
             ), patch.object(main, "ADMIN_ID", 0
             ), patch.object(main, "register_user", new=AsyncMock()), patch.object(
-                main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"
-            ), patch.object(main, "is_user_member", new=AsyncMock(return_value=True)), patch.object(
+                main, "MAIN_CHANNEL_ID", ""
+            ), patch.object(
                 main, "firebase_ready", return_value=True
             ), patch.object(
                 main,
@@ -512,9 +524,9 @@ class SearchAndMediaTests(unittest.TestCase):
         async def run():
             with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
                 main, "register_user", new=AsyncMock()
-            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1002"), patch.object(
-                main, "is_user_member", new=AsyncMock(return_value=True)
-            ), patch.object(main, "firebase_ready", return_value=True), patch.object(
+            ), patch.object(main, "MAIN_CHANNEL_ID", ""), patch.object(
+                main, "firebase_ready", return_value=True
+            ), patch.object(
                 main,
                 "get_catalog_entry",
                 new=AsyncMock(return_value={
@@ -625,8 +637,7 @@ class SearchAndMediaTests(unittest.TestCase):
             with patch.object(main, "ACTIVE_FILE_MESSAGES", set()), patch.object(
                 main, "CONSUMED_FILE_MESSAGES", {}
             ), patch.object(main, "register_user", new=AsyncMock()), patch.object(
-                main, "FORCE_JOIN_CHANNEL_ID", "-1002"
-            ), patch.object(main, "is_user_member", new=AsyncMock(return_value=True)
+                main, "MAIN_CHANNEL_ID", ""
             ), patch.object(main, "firebase_ready", return_value=True), patch.object(
                 main,
                 "get_catalog_entry",
@@ -766,7 +777,7 @@ class SearchAndMediaTests(unittest.TestCase):
             ), patch.object(main, "FIREBASE_SERVICE_ACCOUNT_JSON", ""), patch.object(
                 main, "TELEGRAM_SOURCE_CHATS", ""
             ), patch.object(main, "SOURCE_CHANNEL_IDS", set()), patch.object(
-                main, "FORCE_JOIN_CHANNEL_ID", ""
+                main, "MAIN_CHANNEL_ID", ""
             ), patch.object(main, "firebase_ready", return_value=False):
                 with self.assertRaises(main.HTTPException) as error:
                     await main.healthz()
@@ -777,10 +788,11 @@ class SearchAndMediaTests(unittest.TestCase):
             ), patch.object(main, "FIREBASE_SERVICE_ACCOUNT_JSON", "{}"), patch.object(
                 main, "TELEGRAM_SOURCE_CHATS", "-1001"
             ), patch.object(main, "SOURCE_CHANNEL_IDS", {-1001}), patch.object(
-                main, "FORCE_JOIN_CHANNEL_ID", "-1002"
+                main, "MAIN_CHANNEL_ID", ""
             ), patch.object(main, "firebase_ready", return_value=True):
                 status = await main.healthz()
                 self.assertTrue(status["ok"])
+                self.assertFalse(status["main_channel_configured"])
         asyncio.run(run())
 
     def test_confirmed_broadcast_persists_job_and_schedules_background_worker(self):
