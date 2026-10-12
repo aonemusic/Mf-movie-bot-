@@ -37,7 +37,7 @@ Add values in the Render service's **Environment**. Never commit secrets or past
 | `BOT_WEBHOOK_SECRET` | Recommended | Stable webhook secret. If unset, the app derives a stable secret from `BOT_TOKEN`. |
 | `LOG_LEVEL` | No | Defaults to `INFO`. |
 
-The Firebase JavaScript `apiKey`, `authDomain`, `storageBucket`, `appId`, and `measurementId` are not needed by this server. A web `apiKey` does **not** grant privileged Realtime Database writes. The bot uses the Firebase Admin SDK with `FIREBASE_SERVICE_ACCOUNT_JSON`; keep that private key secret. Keep database client rules private and do not enable unauthenticated public writes.
+The Firebase JavaScript `apiKey`, `authDomain`, `storageBucket`, `appId`, and `measurementId` are not needed by this server. A web `apiKey` does **not** grant privileged Realtime Database writes. The bot uses the Firebase Admin SDK with `FIREBASE_SERVICE_ACCOUNT_JSON`; keep that private key secret. Configure Realtime Database rules to deny unauthenticated reads and writes; the bot accesses it with its service account.
 
 Create the Realtime Database before deploying. In Firebase Console, open **Project settings → Service accounts → Generate new private key**. Put the JSON key in Render as `FIREBASE_SERVICE_ACCOUNT_JSON`; do not add it to GitHub or send it in chat.
 
@@ -62,7 +62,7 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 - `/status` or `/stuts` — admin only; displays unique users who have started the bot privately or searched in a group, total indexed files, total searches, and top searches. Group-only users are analytics-only and cannot receive direct-message broadcasts until they start the bot privately.
 - `/broadcast Your message` — admin only; text-only broadcasts (up to 3,200 characters) are ready now: the bot previews the message and requires a confirmation button before sending. Image/media broadcasts are optional and are not required.
 - `/mirror_history` — admin only, private chat; preview unmirrored DB-channel entries already indexed in Firebase, then confirm before the old files are copied at least three seconds apart.
-- `/mirror_status` — admin only; show the newest archive-mirror backfill state and progress.
+- `/mirror_status` — admin only; show the newest archive-mirror backfill state, progress, and up to three Telegram copy failure details.
 - `/healthz` — public, secret-free readiness check for Render. Returns HTTP 200 only when the bot, Firebase, at least one source channel, and force-join configuration are ready; returns HTTP 503 otherwise.
 
 Render Free services may sleep or restart. Firebase stores the searchable catalog, analytics, user IDs needed for bot messaging, request records, and pending delivery deletions; it does not store the actual media files. Telegram remains the source of media. Users need access to a source post for the bot to copy it successfully.

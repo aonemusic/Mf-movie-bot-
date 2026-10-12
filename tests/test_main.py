@@ -418,6 +418,42 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_archive_mirror_status_shows_failed_item_reason(self):
+        tree = {
+            "archive_mirror_jobs": {
+                "mirror-job": {
+                    "status": "completed_with_errors",
+                    "created_at": "2026-10-12T02:00:00+00:00",
+                    "item_keys": {"-1004443404016_2150": True},
+                    "completed_items": {},
+                    "failed_items": {
+                        "-1004443404016_2150": "BadRequest: Message to copy not found",
+                    },
+                    "copied_count": 0,
+                    "completed_count": 0,
+                    "failed_count": 1,
+                }
+            }
+        }
+        message = SimpleNamespace(chat=SimpleNamespace(type="private"), reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_user=SimpleNamespace(id=77),
+        )
+        context = SimpleNamespace()
+
+        async def run():
+            with patch.object(main, "ADMIN_ID", 77), patch.object(
+                main, "firebase_reference", side_effect=lambda path: FakeTreeReference(tree, path)
+            ):
+                await main.archive_mirror_status_command(update, context)
+
+        asyncio.run(run())
+        status_text = message.reply_text.await_args.args[0]
+        self.assertIn("Failure details", status_text)
+        self.assertIn("-1004443404016_2150", status_text)
+        self.assertIn("BadRequest: Message to copy not found", status_text)
+
     def test_group_search_returns_bot_deep_link_results_without_registering_group_user(self):
         message = SimpleNamespace(
             chat=SimpleNamespace(type="supergroup"),

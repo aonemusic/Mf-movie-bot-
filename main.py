@@ -1431,9 +1431,9 @@ async def run_archive_mirror_job(token: str) -> None:
                     result = outcome
                     failed[key] = result
         except Exception as exc:
-            result = type(exc).__name__
+            result = f"{type(exc).__name__}: {str(exc).replace(chr(10), ' ')[:220]}"
             failed[key] = result
-            logger.warning("Archive mirror failed for one catalog item (%s)", result)
+            logger.warning("Archive mirror failed for item %s (%s)", key, result)
         if key in failed:
             try:
                 await asyncio.to_thread(
@@ -1528,13 +1528,22 @@ async def archive_mirror_status_command(update: Update, context: ContextTypes.DE
         await message.reply_text("<b>MIRROR STATUS UNAVAILABLE</b>\n\nThe latest job record is invalid.", parse_mode="HTML")
         return
     total = len(job.get("item_keys", {})) if isinstance(job.get("item_keys"), dict) else 0
+    failed_items = job.get("failed_items", {})
+    failure_lines = []
+    if isinstance(failed_items, dict):
+        for item_key, reason in list(failed_items.items())[:3]:
+            failure_lines.append(
+                f"\n<code>{html.escape(str(item_key))}</code>: {html.escape(str(reason)[:220])}"
+            )
+    failure_detail = "\n\n<b>Failure details</b>" + "".join(failure_lines) if failure_lines else ""
     await message.reply_text(
         "<b>ARCHIVE MIRROR STATUS</b>\n\n"
         f"State: <b>{html.escape(str(job.get('status', 'unknown')))}</b>\n"
         f"Copied: <b>{int(job.get('copied_count', 0) or 0):,}</b>\n"
         f"Completed: <b>{int(job.get('completed_count', 0) or 0):,} / {total:,}</b>\n"
         f"Could not copy: <b>{int(job.get('failed_count', 0) or 0):,}</b>\n"
-        f"Job: <code>{html.escape(str(token))}</code>",
+        f"Job: <code>{html.escape(str(token))}</code>"
+        f"{failure_detail}",
         parse_mode="HTML",
     )
 
