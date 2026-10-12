@@ -18,7 +18,7 @@ from typing import Any
 import firebase_admin
 from fastapi import FastAPI, Header, HTTPException
 from firebase_admin import credentials, db
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, ContextTypes, TypeHandler
 
@@ -84,6 +84,8 @@ MOVIE_ANNOUNCEMENT_CHANNELS = [
 FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip()
 MAIN_CHANNEL_URL = "https://t.me/mfmainchannel"
+MAIN_CHANNEL_HANDLE = "@mfmainchannel"
+DELIVERY_BOT_HANDLE = "@mf_movie_bot"
 MOVIE_REQUEST_GROUP_URL = "https://t.me/MFMovieandSeriesRequestGroup"
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "").strip()
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
@@ -175,7 +177,7 @@ def extract_media_details(message) -> dict[str, Any] | None:
         return None
 
     file_name = getattr(file_obj, "file_name", None)
-    caption = (getattr(message, "caption", None) or "").strip()
+    caption = getattr(message, "caption", None) or ""
     if not file_name:
         if media_type == "photo" and caption:
             file_name = caption.splitlines()[0][:120]
@@ -183,10 +185,16 @@ def extract_media_details(message) -> dict[str, Any] | None:
             extension = {"video": ".mp4", "audio": ".mp3", "photo": ".jpg"}.get(media_type, "")
             file_name = f"{media_type}_{message.message_id}{extension}"
     search_text = normalize_search_text(f"{file_name} {caption}")
+    caption_entities = [
+        entity.to_dict()
+        for entity in (getattr(message, "caption_entities", None) or [])
+    ]
     return {
         "file_name": str(file_name)[:255],
         "file_size": int(getattr(file_obj, "file_size", 0) or 0),
         "media_type": media_type,
+        "caption": str(caption),
+        "caption_entities": caption_entities,
         "search_text": search_text,
     }
 
@@ -357,9 +365,49 @@ def movie_announcement_destinations() -> list[int | str]:
     return unique
 
 
-def media_caption(record: dict[str, Any]) -> str:
-    name = str(record.get("file_name") or "Movie file")
-    return f"🎬 <code>{html.escape(name[:900])}</code>"
+def _utf16_units(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _truncate_utf16(value: str, max_units: int) -> str:
+    output: list[str] = []
+    used = 0
+    for character in value:
+        units = 2 if ord(character) > 0xFFFF else 1
+        if used + units > max_units:
+            break
+        output.append(character)
+        used += units
+    return "".join(output)
+
+
+def delivered_file_caption(record: dict[str, Any], bot=None) -> tuple[str, list[MessageEntity] | None]:
+    """Combine the original source caption and the delivery footer on the file itself."""
+    source_caption = record.get("caption")
+    if not isinstance(source_caption, str) or not source_caption.strip():
+        source_caption = str(record.get("file_name") or "Movie file")
+    footer = (
+        f"Main channel: {MAIN_CHANNEL_HANDLE}\n"
+        f"Bot: {DELIVERY_BOT_HANDLE}\n"
+        "Auto-deletes in 10 minutes."
+    )
+    separator = "\n\n"
+    source_budget = 1024 - _utf16_units(separator + footer)
+    truncated = _utf16_units(source_caption) > source_budget
+    if truncated:
+        source_caption = _truncate_utf16(source_caption, max(0, source_budget - 1)).rstrip() + "…"
+    caption = f"{source_caption}{separator}{footer}"
+    if truncated:
+        return caption, None
+    raw_entities = record.get("caption_entities")
+    if not isinstance(raw_entities, list):
+        return caption, None
+    entities = [
+        MessageEntity.de_json(entity, bot)
+        for entity in raw_entities
+        if isinstance(entity, dict)
+    ]
+    return caption, entities or None
 
 
 def keyboard_button(text: str, *, callback_data: str | None = None, url: str | None = None, style: str = "success") -> InlineKeyboardButton:
@@ -915,10 +963,13 @@ async def deliver_group_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
     await send_chat_action(context.bot, user.id, upload_action_for_media(str(record.get("media_type", "document"))))
     try:
+        caption, caption_entities = delivered_file_caption(record, context.bot)
         copied = await context.bot.copy_message(
             chat_id=user.id,
             from_chat_id=int(record["source_chat_id"]),
             message_id=int(record["source_message_id"]),
+            caption=caption,
+            caption_entities=caption_entities,
             reply_markup=delivered_file_keyboard(),
         )
     except TelegramError as exc:
@@ -930,19 +981,6 @@ async def deliver_group_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
     file_delete_record = {"chat_id": int(user.id), "message_id": int(copied.message_id), "delete_at": delete_at}
     await persist_pending_delete(file_delete_key, file_delete_record)
     schedule_file_deletion(file_delete_key, user.id, copied.message_id, delete_at)
-    notice = await context.bot.send_message(
-        chat_id=user.id,
-        text=(
-            "<b>YOUR FILE IS READY</b>\n\n"
-            f"<code>{html.escape(str(record.get('file_name', 'File'))[:180])}</code> is now in this private chat. "
-            "The file and this message will be removed automatically in <b>10 minutes</b>."
-        ),
-        parse_mode="HTML",
-    )
-    notice_key = f"{user.id}_{notice.message_id}"
-    notice_record = {"chat_id": int(user.id), "message_id": int(notice.message_id), "delete_at": delete_at}
-    await persist_pending_delete(notice_key, notice_record)
-    schedule_file_deletion(notice_key, user.id, notice.message_id, delete_at)
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, query_text: str) -> None:
@@ -1352,10 +1390,13 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         action = upload_action_for_media(str(record.get("media_type", "document")))
         await send_chat_action(context.bot, query.from_user.id, action)
         try:
+            caption, caption_entities = delivered_file_caption(record, context.bot)
             copied = await context.bot.copy_message(
                 chat_id=query.from_user.id,
                 from_chat_id=int(record["source_chat_id"]),
                 message_id=int(record["source_message_id"]),
+                caption=caption,
+                caption_entities=caption_entities,
                 reply_markup=delivered_file_keyboard(),
             )
         except TelegramError as exc:
@@ -1378,23 +1419,6 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await persist_pending_delete(deletion_key, deletion_record)
         schedule_file_deletion(deletion_key, query.from_user.id, copied.message_id, delete_at)
         await remove_used_search_message(query, context)
-        notice = await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text=(
-                f"<b>DELIVERY COMPLETE</b>\n\n"
-                f"<code>{html.escape(str(record.get('file_name', 'File'))[:180])}</code> is ready. "
-                "This copy will be automatically removed from this chat in <b>10 minutes</b>."
-            ),
-            parse_mode="HTML",
-        )
-        notice_key = f"{query.from_user.id}_{notice.message_id}"
-        notice_record = {
-            "chat_id": int(query.from_user.id),
-            "message_id": int(notice.message_id),
-            "delete_at": delete_at,
-        }
-        await persist_pending_delete(notice_key, notice_record)
-        schedule_file_deletion(notice_key, query.from_user.id, notice.message_id, delete_at)
     finally:
         ACTIVE_FILE_MESSAGES.discard(result_message_key)
 

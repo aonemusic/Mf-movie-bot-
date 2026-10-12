@@ -73,6 +73,8 @@ class SearchAndMediaTests(unittest.TestCase):
         details = main.extract_media_details(message)
         self.assertEqual(details["file_name"], "Movie.Name.mkv")
         self.assertEqual(details["file_size"], 987654321)
+        self.assertEqual(details["caption"], "Movie Name")
+        self.assertEqual(details["caption_entities"], [])
         self.assertIn("movie name", details["search_text"])
 
     def test_photo_uses_largest_size(self):
@@ -88,6 +90,30 @@ class SearchAndMediaTests(unittest.TestCase):
     def test_file_size_formatting(self):
         self.assertEqual(main.format_file_size(0), "Size unknown")
         self.assertEqual(main.format_file_size(1024 * 1024), "1.0 MB")
+
+    def test_delivered_file_caption_attaches_source_and_requested_handles(self):
+        caption, entities = main.delivered_file_caption(
+            {
+                "file_name": "Movie.mkv",
+                "caption": "Original movie caption",
+                "caption_entities": [{"type": "bold", "offset": 0, "length": 8}],
+            }
+        )
+        self.assertTrue(caption.startswith("Original movie caption\n\n"))
+        self.assertIn("Main channel: @mfmainchannel", caption)
+        self.assertIn("Bot: @mf_movie_bot", caption)
+        self.assertIn("Auto-deletes in 10 minutes.", caption)
+        self.assertEqual(entities[0].type, "bold")
+        self.assertEqual((entities[0].offset, entities[0].length), (0, 8))
+
+    def test_delivered_file_caption_preserves_footer_when_source_caption_is_too_long(self):
+        caption, entities = main.delivered_file_caption(
+            {"caption": "🎬" * 1000, "file_name": "Movie.mkv", "caption_entities": []}
+        )
+        self.assertLessEqual(main._utf16_units(caption), 1024)
+        self.assertIn("Main channel: @mfmainchannel", caption)
+        self.assertIn("Bot: @mf_movie_bot", caption)
+        self.assertIsNone(entities)
 
     def test_backup_source_is_added_without_replacing_existing_sources(self):
         self.assertEqual(
@@ -470,7 +496,7 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_signed_group_start_delivers_file_and_expires_file_and_notice(self):
+    def test_signed_group_start_delivers_file_with_attached_caption_and_expires_file(self):
         bot = SimpleNamespace(
             send_chat_action=AsyncMock(),
             copy_message=AsyncMock(return_value=SimpleNamespace(message_id=501)),
@@ -502,9 +528,8 @@ class SearchAndMediaTests(unittest.TestCase):
             ) as schedule:
                 payload = main.make_file_start_payload("-1001_9")
                 await main.start_command(update, context, payload)
-                self.assertEqual(persist.await_count, 2)
-                self.assertEqual(schedule.call_count, 2)
-                self.assertEqual(schedule.call_args_list[0].args[-1], schedule.call_args_list[1].args[-1])
+                self.assertEqual(persist.await_count, 1)
+                self.assertEqual(schedule.call_count, 1)
 
         asyncio.run(run())
         bot.copy_message.assert_awaited_once()
@@ -517,7 +542,10 @@ class SearchAndMediaTests(unittest.TestCase):
             [button.url for button in copy_args["reply_markup"].inline_keyboard[0]],
             ["https://t.me/mfmainchannel", "https://t.me/MFMovieandSeriesRequestGroup"],
         )
-        self.assertIn("removed automatically", bot.send_message.await_args.kwargs["text"])
+        self.assertIn("Main channel: @mfmainchannel", copy_args["caption"])
+        self.assertIn("Bot: @mf_movie_bot", copy_args["caption"])
+        self.assertIn("Auto-deletes in 10 minutes.", copy_args["caption"])
+        bot.send_message.assert_not_awaited()
 
     def test_request_keyboard_has_callback_and_green_style(self):
         previous = dict(main.MOVIE_REQUEST_SESSIONS)
@@ -572,16 +600,12 @@ class SearchAndMediaTests(unittest.TestCase):
             events.append("results")
             return True
 
-        async def send_notice(**kwargs):
-            events.append("notice")
-            return SimpleNamespace(message_id=89)
-
         bot = SimpleNamespace(
             send_chat_action=AsyncMock(),
             copy_message=AsyncMock(side_effect=copy_file),
             delete_message=AsyncMock(side_effect=delete_results),
             edit_message_reply_markup=AsyncMock(),
-            send_message=AsyncMock(side_effect=send_notice),
+            send_message=AsyncMock(),
         )
         message = SimpleNamespace(
             chat=SimpleNamespace(type="private"),
@@ -612,6 +636,8 @@ class SearchAndMediaTests(unittest.TestCase):
                         "source_chat_id": -1001,
                         "source_message_id": 7,
                         "file_name": "Movie.mkv",
+                        "caption": "Original caption",
+                        "caption_entities": [],
                     }
                 ),
             ), patch.object(main, "persist_pending_delete", new=AsyncMock()) as persist, patch.object(
@@ -619,20 +645,24 @@ class SearchAndMediaTests(unittest.TestCase):
             ) as schedule:
                 await main.file_button_callback(update, context)
                 await main.file_button_callback(update, context)
-                self.assertEqual(persist.await_count, 2)
-                self.assertEqual(schedule.call_count, 2)
-                self.assertEqual(schedule.call_args_list[0].args[-1], schedule.call_args_list[1].args[-1])
+                self.assertEqual(persist.await_count, 1)
+                self.assertEqual(schedule.call_count, 1)
 
         asyncio.run(run())
-        self.assertEqual(events, ["file", "results", "notice"])
+        self.assertEqual(events, ["file", "results"])
         bot.copy_message.assert_awaited_once()
         copy_args = bot.copy_message.await_args.kwargs
         self.assertEqual(
             {key: copy_args[key] for key in ("chat_id", "from_chat_id", "message_id")},
             {"chat_id": 77, "from_chat_id": -1001, "message_id": 7},
         )
+        self.assertTrue(copy_args["caption"].startswith("Original caption\n\n"))
+        self.assertIn("Main channel: @mfmainchannel", copy_args["caption"])
+        self.assertIn("Bot: @mf_movie_bot", copy_args["caption"])
+        self.assertIn("Auto-deletes in 10 minutes.", copy_args["caption"])
         self.assertEqual(copy_args["reply_markup"].inline_keyboard[0][0].style, "danger")
         self.assertEqual(copy_args["reply_markup"].inline_keyboard[0][1].style, "success")
+        bot.send_message.assert_not_awaited()
         bot.delete_message.assert_awaited_once_with(chat_id=77, message_id=33)
         self.assertEqual(query.answer.await_count, 2)
         self.assertIn("already used", query.answer.await_args.args[0])
