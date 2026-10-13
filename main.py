@@ -271,6 +271,17 @@ def make_file_start_payload(key: str) -> str:
     return payload
 
 
+def make_movie_search_start_payload(title: str) -> str:
+    title = re.sub(r"\.[A-Za-z0-9]{1,8}$", "", str(title or "").strip())
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", title).strip("_")
+    if len(slug) < 2:
+        raise ValueError("Movie title cannot be represented in a Telegram search link")
+    slug = slug[:57].rstrip("_")
+    if len(slug) < 2:
+        raise ValueError("Movie title cannot be represented in a Telegram search link")
+    return f"search_{slug}"
+
+
 def file_key_from_start_payload(payload: str) -> str | None:
     if not BOT_TOKEN or not isinstance(payload, str) or not payload.startswith("f"):
         return None
@@ -330,10 +341,13 @@ def new_file_announcement_text(record: dict[str, Any]) -> str:
     )
 
 
-def new_file_announcement_keyboard(key: str) -> InlineKeyboardMarkup:
+def new_file_announcement_keyboard(key: str, movie_title: str = "") -> InlineKeyboardMarkup:
     if not BOT_USERNAME:
         raise ValueError("Bot identity is not ready")
-    payload = make_file_start_payload(key)
+    try:
+        payload = make_movie_search_start_payload(movie_title)
+    except ValueError:
+        payload = make_file_start_payload(key)
     return InlineKeyboardMarkup(
         [[keyboard_button("Get File", url=f"https://t.me/{BOT_USERNAME}?start={payload}", style="primary")]]
     )
@@ -832,6 +846,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
     if not message:
         return
     if user and message.chat.type == "private":
+        if payload.startswith("search_"):
+            query_text = payload[len("search_") :].replace("_", " ").strip()
+            await search_command(update, context, query_text)
+            return
         await register_user(user)
         if payload:
             if payload.startswith("r"):
@@ -1108,7 +1126,7 @@ async def index_channel_post(update: Update) -> None:
                 chat_id=destination,
                 text=new_file_announcement_text(record),
                 parse_mode="HTML",
-                reply_markup=new_file_announcement_keyboard(key),
+                reply_markup=new_file_announcement_keyboard(key, str(record.get("file_name") or "")),
             )
             logger.info("Posted one new-file announcement to a configured channel")
         except Exception as exc:

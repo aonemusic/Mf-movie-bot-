@@ -101,6 +101,22 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertIn("(optional)", welcome)
         self.assertIn(f'<a href="{main.INSTAGRAM_URL}">Instagram</a>', welcome)
 
+    def test_start_search_deep_link_runs_private_search_from_title_slug(self):
+        message = SimpleNamespace(chat=SimpleNamespace(type="private"), reply_text=AsyncMock())
+        user = SimpleNamespace(id=77)
+        update = SimpleNamespace(effective_message=message, effective_user=user)
+        context = SimpleNamespace(bot=SimpleNamespace())
+
+        async def run():
+            with patch.object(main, "register_user", new=AsyncMock()) as register, patch.object(
+                main, "search_command", new=AsyncMock()
+            ) as search:
+                await main.start_command(update, context, "search_Fractured_2019")
+                register.assert_not_awaited()
+                search.assert_awaited_once_with(update, context, "Fractured 2019")
+
+        asyncio.run(run())
+
     def test_file_size_formatting(self):
         self.assertEqual(main.format_file_size(0), "Size unknown")
         self.assertEqual(main.format_file_size(1024 * 1024), "1.0 MB")
@@ -255,16 +271,18 @@ class SearchAndMediaTests(unittest.TestCase):
     def test_new_file_announcement_has_filename_size_and_get_file_deep_link(self):
         record = {"file_name": "Movie <HD>.mkv", "file_size": 1024 * 1024}
         with patch.object(main, "BOT_TOKEN", "123456:unit-test-token"), patch.object(
-            main, "BOT_USERNAME", "mf_movie_library_bot"
+            main, "BOT_USERNAME", "mf_movie_bot"
         ):
             text = main.new_file_announcement_text(record)
-            keyboard = main.new_file_announcement_keyboard("-1004443404016_88")
+            keyboard = main.new_file_announcement_keyboard("-1004443404016_88", record["file_name"])
             button = keyboard.inline_keyboard[0][0]
             payload = button.url.split("?start=", 1)[1]
             self.assertIn("Movie &lt;HD&gt;.mkv", text)
             self.assertIn("1.0 MB", text)
             self.assertEqual(button.text, "Get File")
-            self.assertEqual(main.file_key_from_start_payload(payload), "-1004443404016_88")
+            self.assertEqual(payload, "search_Movie_HD")
+            self.assertEqual(button.url, "https://t.me/mf_movie_bot?start=search_Movie_HD")
+            self.assertEqual(main.make_movie_search_start_payload("Fractured 2019.mkv"), "search_Fractured_2019")
 
     def test_new_upload_is_announced_once_to_all_configured_channels(self):
         chat = SimpleNamespace(id=-1004443404016, title="DB archive", username=None)
@@ -296,6 +314,10 @@ class SearchAndMediaTests(unittest.TestCase):
             self.assertEqual(
                 bot.send_message.await_args_list[0].kwargs["reply_markup"].inline_keyboard[0][0].text,
                 "Get File",
+            )
+            self.assertEqual(
+                bot.send_message.await_args_list[0].kwargs["reply_markup"].inline_keyboard[0][0].url,
+                "https://t.me/mf_movie_library_bot?start=search_Movie",
             )
             bot.send_message.reset_mock()
             with patch.object(main, "SOURCE_CHANNEL_IDS", {-1004443404016, -1004443404020}), patch.object(
