@@ -123,6 +123,47 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_force_join_can_be_disabled_without_calling_telegram(self):
+        bot = SimpleNamespace(get_chat_member=AsyncMock())
+
+        async def run():
+            with patch.object(main, "FORCE_JOIN_ENABLED", False):
+                self.assertTrue(await REAL_IS_USER_MEMBER(bot, 77))
+            bot.get_chat_member.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_force_join_command_is_admin_only_and_toggles_state(self):
+        old_admin = main.ADMIN_ID
+        old_enabled = main.FORCE_JOIN_ENABLED
+
+        async def run():
+            try:
+                main.ADMIN_ID = 42
+                main.FORCE_JOIN_ENABLED = True
+                non_admin_message = SimpleNamespace(reply_text=AsyncMock())
+                await main.force_join_command(
+                    SimpleNamespace(effective_message=non_admin_message, effective_user=SimpleNamespace(id=7)),
+                    SimpleNamespace(),
+                    "off",
+                )
+                non_admin_message.reply_text.assert_awaited_once_with("Admin only.")
+
+                admin_message = SimpleNamespace(reply_text=AsyncMock())
+                with patch.object(main, "set_force_join_enabled", new=AsyncMock()) as toggle:
+                    await main.force_join_command(
+                        SimpleNamespace(effective_message=admin_message, effective_user=SimpleNamespace(id=42)),
+                        SimpleNamespace(),
+                        "off",
+                    )
+                toggle.assert_awaited_once_with(False)
+                self.assertIn("INACTIVE", admin_message.reply_text.await_args.args[0])
+            finally:
+                main.ADMIN_ID = old_admin
+                main.FORCE_JOIN_ENABLED = old_enabled
+
+        asyncio.run(run())
+
     def test_nonmembers_are_blocked_from_every_catalog_and_delivery_path(self):
         user = SimpleNamespace(id=77)
         bot = SimpleNamespace(send_chat_action=AsyncMock())

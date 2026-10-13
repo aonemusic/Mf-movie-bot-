@@ -86,6 +86,7 @@ MAIN_CHANNEL_HANDLE = "@mfmainchannel"
 MAIN_CHANNEL_ID = os.getenv("MAIN_CHANNEL_ID", "").strip() or os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip() or MAIN_CHANNEL_ID
 FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip() or MAIN_CHANNEL_URL
+FORCE_JOIN_ENABLED = os.getenv("FORCE_JOIN_ENABLED", "true").strip().lower() not in {"0", "false", "off", "no"}
 ADMIN_CONTACT_URL = "https://t.me/mf_admin_contact_bot"
 DELIVERY_BOT_HANDLE = "@mf_movie_bot"
 INSTAGRAM_URL = "https://www.instagram.com/mallu.film.ott.updates?cplk=MXdhZHh5YjMzYXViNw=="
@@ -373,7 +374,9 @@ def force_join_keyboard() -> InlineKeyboardMarkup:
 
 
 async def is_user_member(bot, user_id: int) -> bool:
-    """Fail closed unless Telegram confirms membership in the required channel."""
+    """Return true for everyone when the admin has disabled Force Join."""
+    if not FORCE_JOIN_ENABLED:
+        return True
     if not FORCE_JOIN_CHANNEL_ID:
         return False
     try:
@@ -388,6 +391,33 @@ async def is_user_member(bot, user_id: int) -> bool:
     return status in {"creator", "administrator", "member"} or (
         status == "restricted" and bool(getattr(member, "is_member", False))
     )
+
+
+async def load_force_join_setting() -> None:
+    """Restore the admin's Force Join choice from Firebase when available."""
+    global FORCE_JOIN_ENABLED
+    if not firebase_ready():
+        return
+    try:
+        value = await asyncio.to_thread(firebase_reference("settings/force_join_enabled").get)
+        if isinstance(value, bool):
+            FORCE_JOIN_ENABLED = value
+    except Exception as exc:
+        logger.warning("Could not load Force Join setting (%s)", type(exc).__name__)
+
+
+async def set_force_join_enabled(enabled: bool) -> None:
+    """Update the runtime setting and persist it for the next restart."""
+    global FORCE_JOIN_ENABLED
+    FORCE_JOIN_ENABLED = bool(enabled)
+    if firebase_ready():
+        try:
+            await asyncio.to_thread(
+                firebase_reference("settings/force_join_enabled").set,
+                FORCE_JOIN_ENABLED,
+            )
+        except Exception as exc:
+            logger.warning("Could not persist Force Join setting (%s)", type(exc).__name__)
 
 
 async def send_force_join_prompt(message) -> None:
@@ -1694,6 +1724,36 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def force_join_command(update: Update, context: ContextTypes.DEFAULT_TYPE, argument: str = "") -> None:
+    """Let the configured admin activate, deactivate, or inspect Force Join."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await message.reply_text("Admin only.")
+        return
+    choice = (argument or "").strip().casefold()
+    if choice in {"on", "enable", "enabled", "active", "activate", "1", "true"}:
+        await set_force_join_enabled(True)
+        await message.reply_text("Force Join is now <b>ACTIVE</b>.", parse_mode="HTML")
+    elif choice in {"off", "disable", "disabled", "inactive", "deactivate", "0", "false"}:
+        await set_force_join_enabled(False)
+        await message.reply_text("Force Join is now <b>INACTIVE</b>.", parse_mode="HTML")
+    elif choice in {"", "status"}:
+        state = "ACTIVE" if FORCE_JOIN_ENABLED else "INACTIVE"
+        await message.reply_text(
+            f"Force Join is currently <b>{state}</b>.\n\n"
+            "Use <code>/forcejoin on</code> or <code>/forcejoin off</code>.",
+            parse_mode="HTML",
+        )
+    else:
+        await message.reply_text(
+            "Use <code>/forcejoin on</code>, <code>/forcejoin off</code>, or <code>/forcejoin status</code>.",
+            parse_mode="HTML",
+        )
+
+
 async def notify_admin(text: str) -> None:
     if not BOT_APP or not ADMIN_ID:
         return
@@ -2039,6 +2099,8 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif command == "/broadcast":
         if ADMIN_ID and user.id == ADMIN_ID:
             await prepare_broadcast(update, context, argument)
+    elif command == "/forcejoin":
+        await force_join_command(update, context, argument)
     elif command.startswith("/"):
         return
     else:
@@ -2155,6 +2217,7 @@ async def configure_bot(application: Application) -> None:
             BotCommand("request", "Admin: review movie requests"),
             BotCommand("requests", "Admin: review movie requests"),
             BotCommand("broadcast", "Admin: prepare a confirmed broadcast"),
+            BotCommand("forcejoin", "Admin: toggle Force Join"),
         ]
     )
     if RENDER_EXTERNAL_URL:
@@ -2173,6 +2236,7 @@ async def configure_bot(application: Application) -> None:
 async def lifespan(application: FastAPI):
     global BOT_APP, FIREBASE_APP
     FIREBASE_APP = initialize_firebase()
+    await load_force_join_setting()
     if BOT_TOKEN:
         BOT_APP = Application.builder().token(BOT_TOKEN).updater(None).build()
         BOT_APP.add_handler(TypeHandler(Update, dispatch_update))
