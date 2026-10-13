@@ -20,6 +20,10 @@ services:
         sync: false
       - key: MAIN_CHANNEL_ID
         sync: false
+      - key: FORCE_JOIN_CHANNEL_ID
+        value: "-1004352245988"
+      - key: FORCE_JOIN_CHANNEL_URL
+        value: https://t.me/mfmainchannel
       - key: FIREBASE_DATABASE_URL
         sync: false
       - key: FIREBASE_PROJECT_ID

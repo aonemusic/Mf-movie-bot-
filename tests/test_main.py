@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import main
 
+REAL_IS_USER_MEMBER = main.is_user_member
+
 
 class FakeReference:
     def __init__(self, value=None):
@@ -60,6 +62,11 @@ class FakeTreeReference:
 
 
 class SearchAndMediaTests(unittest.TestCase):
+    def setUp(self):
+        membership = patch.object(main, "is_user_member", new=AsyncMock(return_value=True))
+        membership.start()
+        self.addCleanup(membership.stop)
+
     def test_search_normalization_is_case_insensitive_and_unicode_safe(self):
         self.assertEqual(main.normalize_search_text("The.Matrix_1999.MKV"), "the matrix 1999 mkv")
         self.assertEqual(main.normalize_search_text("Cafe\u0301 2025"), "cafe\u0301 2025")
@@ -87,7 +94,7 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertEqual(details["file_size"], 100)
         self.assertEqual(details["file_name"], "Film poster")
 
-    def test_start_welcome_keeps_main_channel_link_optional(self):
+    def test_start_welcome_shows_required_join_link_and_instagram(self):
         message = SimpleNamespace(
             chat=SimpleNamespace(type="private"),
             reply_text=AsyncMock(),
@@ -98,8 +105,78 @@ class SearchAndMediaTests(unittest.TestCase):
 
         welcome = message.reply_text.await_args.args[0]
         self.assertIn(main.MAIN_CHANNEL_URL, welcome)
-        self.assertIn("(optional)", welcome)
+        self.assertIn("to unlock the library", welcome)
         self.assertIn(f'<a href="{main.INSTAGRAM_URL}">Instagram</a>', welcome)
+        self.assertIn(main.ADMIN_CONTACT_URL, welcome)
+
+    def test_force_join_helper_checks_telegram_and_fails_closed(self):
+        bot = SimpleNamespace(get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")))
+
+        async def run():
+            with patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"):
+                self.assertTrue(await REAL_IS_USER_MEMBER(bot, 77))
+                bot.get_chat_member.assert_awaited_once_with(chat_id=-1004352245988, user_id=77)
+                bot.get_chat_member.return_value = SimpleNamespace(status="left")
+                self.assertFalse(await REAL_IS_USER_MEMBER(bot, 77))
+                with patch.object(main, "FORCE_JOIN_CHANNEL_ID", ""):
+                    self.assertFalse(await REAL_IS_USER_MEMBER(bot, 77))
+
+        asyncio.run(run())
+
+    def test_nonmembers_are_blocked_from_every_catalog_and_delivery_path(self):
+        user = SimpleNamespace(id=77)
+        bot = SimpleNamespace(send_chat_action=AsyncMock())
+        context = SimpleNamespace(bot=bot)
+
+        async def run():
+            with patch.object(main, "is_user_member", new=AsyncMock(return_value=False)):
+                search_message = SimpleNamespace(
+                    chat=SimpleNamespace(type="private"), chat_id=77, reply_text=AsyncMock()
+                )
+                await main.search_command(
+                    SimpleNamespace(effective_message=search_message, effective_user=user),
+                    context,
+                    "Fractured",
+                )
+                self.assertIn("MEMBERSHIP REQUIRED", search_message.reply_text.await_args.args[0])
+                self.assertEqual(
+                    search_message.reply_text.await_args.kwargs["reply_markup"].inline_keyboard[0][0].url,
+                    main.MAIN_CHANNEL_URL,
+                )
+
+                latest_message = SimpleNamespace(
+                    chat=SimpleNamespace(type="private"), chat_id=77, reply_text=AsyncMock()
+                )
+                await main.latest_command(
+                    SimpleNamespace(effective_message=latest_message, effective_user=user), context
+                )
+                self.assertIn("MEMBERSHIP REQUIRED", latest_message.reply_text.await_args.args[0])
+
+                file_message = SimpleNamespace(
+                    chat=SimpleNamespace(type="private"), reply_text=AsyncMock()
+                )
+                file_query = SimpleNamespace(
+                    message=file_message, from_user=user, data="file:-1001_9", answer=AsyncMock()
+                )
+                await main.file_button_callback(SimpleNamespace(callback_query=file_query), context)
+                self.assertIn("MEMBERSHIP REQUIRED", file_message.reply_text.await_args.args[0])
+
+                page_message = SimpleNamespace(
+                    chat=SimpleNamespace(type="private"), chat_id=77, reply_text=AsyncMock()
+                )
+                page_query = SimpleNamespace(
+                    message=page_message, from_user=user, data="page:missing:10", answer=AsyncMock()
+                )
+                await main.search_page_callback(SimpleNamespace(callback_query=page_query), context)
+                self.assertIn("MEMBERSHIP REQUIRED", page_message.reply_text.await_args.args[0])
+
+                token = main.make_movie_request_session(user.id, "Moonlight")
+                status, title, keyboard = await main.submit_movie_request(bot, user, token)
+                self.assertEqual((status, title), ("membership", "Moonlight"))
+                self.assertEqual(keyboard.inline_keyboard[0][0].url, main.MAIN_CHANNEL_URL)
+                main.MOVIE_REQUEST_SESSIONS.pop(token, None)
+
+        asyncio.run(run())
 
     def test_start_search_deep_link_runs_private_search_from_title_slug(self):
         message = SimpleNamespace(chat=SimpleNamespace(type="private"), reply_text=AsyncMock())
@@ -809,7 +886,9 @@ class SearchAndMediaTests(unittest.TestCase):
                 main, "TELEGRAM_SOURCE_CHATS", ""
             ), patch.object(main, "SOURCE_CHANNEL_IDS", set()), patch.object(
                 main, "MAIN_CHANNEL_ID", ""
-            ), patch.object(main, "firebase_ready", return_value=False):
+            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", ""), patch.object(
+                main, "firebase_ready", return_value=False
+            ):
                 with self.assertRaises(main.HTTPException) as error:
                     await main.healthz()
                 self.assertEqual(error.exception.status_code, 503)
@@ -820,10 +899,13 @@ class SearchAndMediaTests(unittest.TestCase):
                 main, "TELEGRAM_SOURCE_CHATS", "-1001"
             ), patch.object(main, "SOURCE_CHANNEL_IDS", {-1001}), patch.object(
                 main, "MAIN_CHANNEL_ID", ""
-            ), patch.object(main, "firebase_ready", return_value=True):
+            ), patch.object(main, "FORCE_JOIN_CHANNEL_ID", "-1004352245988"), patch.object(
+                main, "firebase_ready", return_value=True
+            ):
                 status = await main.healthz()
                 self.assertTrue(status["ok"])
                 self.assertFalse(status["main_channel_configured"])
+                self.assertTrue(status["force_join_configured"])
         asyncio.run(run())
 
     def test_confirmed_broadcast_persists_job_and_schedules_background_worker(self):

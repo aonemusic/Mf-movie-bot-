@@ -81,9 +81,12 @@ MOVIE_ANNOUNCEMENT_CHANNELS = [
     for item in os.getenv("MOVIE_ANNOUNCEMENT_CHANNELS", "").split(",")
     if item.strip()
 ]
-MAIN_CHANNEL_ID = os.getenv("MAIN_CHANNEL_ID", "").strip() or os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 MAIN_CHANNEL_URL = "https://t.me/mfmainchannel"
 MAIN_CHANNEL_HANDLE = "@mfmainchannel"
+MAIN_CHANNEL_ID = os.getenv("MAIN_CHANNEL_ID", "").strip() or os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
+FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip() or MAIN_CHANNEL_ID
+FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip() or MAIN_CHANNEL_URL
+ADMIN_CONTACT_URL = "https://t.me/mf_admin_contact_bot"
 DELIVERY_BOT_HANDLE = "@mf_movie_bot"
 INSTAGRAM_URL = "https://www.instagram.com/mallu.film.ott.updates?cplk=MXdhZHh5YjMzYXViNw=="
 MOVIE_REQUEST_GROUP_URL = "https://t.me/MFMovieandSeriesRequestGroup"
@@ -360,6 +363,43 @@ def delivered_file_keyboard() -> InlineKeyboardMarkup:
             keyboard_button("Join Main Channel", url=MAIN_CHANNEL_URL, style="danger"),
             keyboard_button("Movie Request Group", url=MOVIE_REQUEST_GROUP_URL, style="success"),
         ]]
+    )
+
+
+def force_join_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[keyboard_button("Join @mfmainchannel", url=FORCE_JOIN_CHANNEL_URL, style="danger")]]
+    )
+
+
+async def is_user_member(bot, user_id: int) -> bool:
+    """Fail closed unless Telegram confirms membership in the required channel."""
+    if not FORCE_JOIN_CHANNEL_ID:
+        return False
+    try:
+        member = await bot.get_chat_member(
+            chat_id=chat_reference(FORCE_JOIN_CHANNEL_ID), user_id=user_id
+        )
+    except TelegramError as exc:
+        logger.warning("Force Join membership check failed (%s)", type(exc).__name__)
+        return False
+    raw_status = getattr(member, "status", "")
+    status = str(getattr(raw_status, "value", raw_status))
+    return status in {"creator", "administrator", "member"} or (
+        status == "restricted" and bool(getattr(member, "is_member", False))
+    )
+
+
+async def send_force_join_prompt(message) -> None:
+    if not message:
+        return
+    await message.reply_text(
+        "<b>MEMBERSHIP REQUIRED</b>\n\n"
+        "Join @mfmainchannel to unlock movie search, the latest additions, and file delivery.\n\n"
+        "After joining, send your movie title again or tap your selected file button once more.\n\n"
+        f'<a href="{ADMIN_CONTACT_URL}">Contact the admin</a> if you need help.',
+        parse_mode="HTML",
+        reply_markup=force_join_keyboard(),
     )
 
 
@@ -873,6 +913,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
                         "<b>REQUEST LINK EXPIRED</b>\n\nSearch for the movie again and tap its request button.",
                         parse_mode="HTML",
                     )
+                elif status == "membership":
+                    await send_force_join_prompt(message)
                 else:
                     await message.reply_text(
                         "<b>REQUEST TEMPORARILY UNAVAILABLE</b>\n\nPlease try again shortly.",
@@ -888,11 +930,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
                 return
             await deliver_group_file(update, context, key)
             return
+        if not await is_user_member(context.bot, user.id):
+            await send_force_join_prompt(message)
+            return
     await message.reply_text(
         "<b>MF MOVIE LIBRARY</b>\n"
         "<i>Your archive, beautifully within reach.</i>\n\n"
-        f'<a href="{MAIN_CHANNEL_URL}">Join our main channel for updates</a> (optional) · '
-        f'<a href="{INSTAGRAM_URL}">Instagram</a>.\n\n'
+        f'<a href="{FORCE_JOIN_CHANNEL_URL}">Join @mfmainchannel</a> to unlock the library · '
+        f'<a href="{INSTAGRAM_URL}">Instagram</a> · '
+        f'<a href="{ADMIN_CONTACT_URL}">Contact admin</a>.\n\n'
         "<b>Search</b>\n"
         "Send a movie title or filename as a regular message. Browse results with Next and Back, then choose a file.\n"
         "Send /latest to browse the newest additions.\n\n"
@@ -909,6 +955,9 @@ async def deliver_group_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
     message = update.effective_message
     user = update.effective_user
     if not message or not user or message.chat.type != "private":
+        return
+    if not await is_user_member(context.bot, user.id):
+        await send_force_join_prompt(message)
         return
     await send_chat_action(context.bot, user.id, "typing")
     if not firebase_ready():
@@ -952,6 +1001,9 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE, que
         return
     is_private = message.chat.type == "private"
     if not is_private and message.chat.type not in {"group", "supergroup"}:
+        return
+    if not await is_user_member(context.bot, user.id):
+        await send_force_join_prompt(message)
         return
     await send_chat_action(context.bot, message.chat_id, "typing")
     if is_private:
@@ -1023,6 +1075,9 @@ async def latest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     is_private = message.chat.type == "private"
     if not is_private and message.chat.type not in {"group", "supergroup"}:
+        return
+    if not await is_user_member(context.bot, user.id):
+        await send_force_join_prompt(message)
         return
     await send_chat_action(context.bot, message.chat_id, "typing")
     if is_private:
@@ -1270,6 +1325,10 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if query.message.chat.type != "private":
         await query.answer("Open a private chat with MF Movie Library to receive files.", show_alert=True)
         return
+    if not await is_user_member(context.bot, query.from_user.id):
+        await query.answer("Join @mfmainchannel to unlock file delivery.", show_alert=True)
+        await send_force_join_prompt(query.message)
+        return
     await register_user(query.from_user)
     key = (query.data or "").removeprefix("file:")
     if not re.fullmatch(r"-?\d{1,19}_\d{1,20}", key):
@@ -1361,6 +1420,8 @@ async def submit_movie_request(bot, user, token: str) -> tuple[str, str, InlineK
         MOVIE_REQUEST_SESSIONS.pop(token, None)
         return "expired", "", None
     title = str(request_session["title"])
+    if not await is_user_member(bot, user.id):
+        return "membership", title, force_join_keyboard()
     if not firebase_ready():
         return "unavailable", title, None
 
@@ -1415,10 +1476,10 @@ async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_T
     if query.message.chat.type != "private":
         await query.answer("Open the request in your private chat with the bot.", show_alert=True)
         return
-    await register_user(query.from_user)
     token = (query.data or "").removeprefix("movie_request:")
     status, title, keyboard = await submit_movie_request(context.bot, query.from_user, token)
     if status == "ok":
+        await register_user(query.from_user)
         await query.answer("Request sent to the admin.")
         await query.edit_message_text(
             "<b>REQUEST RECEIVED</b>\n\n"
@@ -1426,6 +1487,9 @@ async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_T
             "If it is added, you will receive a message here.",
             parse_mode="HTML",
         )
+    elif status == "membership":
+        await query.answer("Join @mfmainchannel to submit a movie request.", show_alert=True)
+        await send_force_join_prompt(query.message)
     else:
         await query.answer(
             "This request link has expired. Search again." if status == "expired"
@@ -1598,7 +1662,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "<b>MF MOVIE LIBRARY · LIVE STATUS</b>\n\n"
             "Realtime Database: <b>Not ready</b>\n"
             f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
-            f'Channel membership: <b>Optional</b> · <a href="{MAIN_CHANNEL_URL}">@mfmainchannel</a>',
+            f'Channel membership: <b>Required</b> · <a href="{FORCE_JOIN_CHANNEL_URL}">@mfmainchannel</a>',
             parse_mode="HTML",
         )
         return
@@ -1623,7 +1687,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Total files: <b>{stats['total_files']:,}</b>\n"
         f"Total searches: <b>{stats['total_searches']:,}</b>\n"
         f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
-        f'Channel membership: <b>Optional</b> · <a href="{MAIN_CHANNEL_URL}">@mfmainchannel</a>\n'
+        f'Channel membership: <b>Required</b> · <a href="{FORCE_JOIN_CHANNEL_URL}">@mfmainchannel</a>\n'
         f"Automatic file deletion: <b>{DELETE_AFTER_SECONDS // 60} minutes</b>\n\n"
         f"<b>TOP SEARCHES</b>\n{top_text}",
         parse_mode="HTML",
@@ -1989,6 +2053,10 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_private and query.message.chat.type not in {"group", "supergroup"}:
         await query.answer("Search results are not available in this chat.", show_alert=True)
         return
+    if not await is_user_member(context.bot, query.from_user.id):
+        await query.answer("Join @mfmainchannel to unlock the catalog.", show_alert=True)
+        await send_force_join_prompt(query.message)
+        return
     if is_private:
         await register_user(query.from_user)
     try:
@@ -2153,6 +2221,7 @@ async def healthz():
         "source_channels_configured": bool(TELEGRAM_SOURCE_CHATS),
         "source_channels_resolved": len(SOURCE_CHANNEL_IDS),
         "main_channel_configured": bool(MAIN_CHANNEL_ID),
+        "force_join_configured": bool(FORCE_JOIN_CHANNEL_ID and FORCE_JOIN_CHANNEL_URL),
         "search_result_limit": MAX_SEARCH_RESULTS,
         "delete_after_minutes": DELETE_AFTER_SECONDS // 60,
     }
@@ -2162,6 +2231,7 @@ async def healthz():
         and status["firebase_ready"]
         and status["source_channels_configured"]
         and status["source_channels_resolved"] > 0
+        and status["force_join_configured"]
     )
     status["ok"] = ready
     if not ready:
