@@ -164,6 +164,29 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_movie_channel_link_validation_and_join_message(self):
+        self.assertTrue(main.valid_movie_channel_link("https://t.me/mf_movies"))
+        self.assertFalse(main.valid_movie_channel_link("https://example.com/movies"))
+        bot = SimpleNamespace(send_message=AsyncMock())
+        old_links = list(main.MOVIE_CHANNEL_LINKS)
+
+        async def run():
+            try:
+                main.MOVIE_CHANNEL_LINKS[:] = ["https://t.me/mf_movies", "https://t.me/mf_updates"]
+                await main.send_join_and_enjoy_message(bot, 77)
+            finally:
+                main.MOVIE_CHANNEL_LINKS[:] = old_links
+
+        asyncio.run(run())
+        bot.send_message.assert_awaited_once()
+        kwargs = bot.send_message.await_args.kwargs
+        self.assertEqual(kwargs["chat_id"], 77)
+        self.assertIn("JOIN AND ENJOY", kwargs["text"])
+        self.assertEqual(
+            [button.url for row in kwargs["reply_markup"].inline_keyboard for button in row],
+            ["https://t.me/mf_movies", "https://t.me/mf_updates"],
+        )
+
     def test_nonmembers_are_blocked_from_every_catalog_and_delivery_path(self):
         user = SimpleNamespace(id=77)
         bot = SimpleNamespace(send_chat_action=AsyncMock())

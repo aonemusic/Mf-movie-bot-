@@ -58,6 +58,7 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 - `/status` or `/stuts` — admin only; displays unique users who have started the bot privately or searched in a group, total indexed files, total searches, and top searches. Group-only users are analytics-only and cannot receive direct-message broadcasts until they start the bot privately.
 - `/broadcast Your message` — admin only; text-only broadcasts (up to 3,200 characters) are ready now: the bot previews the message and requires a confirmation button before sending. Image/media broadcasts are optional and are not required.
 - `/forcejoin on|off|status` — admin only; activate or deactivate the required-channel membership check. The choice is saved in Firebase and restored after a restart. It is active by default.
+- `/addnewchannel` — admin only; manage the Telegram channel links shown in a separate **JOIN AND ENJOY** message after each delivered file. Use **Add channel** to save a link or **Remove channel** to delete one.
 - `/healthz` — public, secret-free readiness check for Render. Returns HTTP 200 only when the bot, Firebase, at least one source channel, and required Force Join configuration are ready; returns HTTP 503 otherwise.
 
 Render Free services may sleep or restart. Firebase stores the searchable catalog, analytics, user IDs needed for bot messaging, request records, and pending delivery deletions; it does not store the actual media files. Telegram remains the source of media. Users need access to a source post for the bot to copy it successfully.

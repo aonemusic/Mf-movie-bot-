@@ -14,6 +14,7 @@ import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 import firebase_admin
 from fastapi import FastAPI, Header, HTTPException
@@ -117,6 +118,8 @@ ACTIVE_FILE_MESSAGES: set[tuple[int, int]] = set()
 CONSUMED_FILE_MESSAGES: dict[tuple[int, int], float] = {}
 MOVIE_REQUEST_SESSIONS: dict[str, dict[str, Any]] = {}
 PENDING_BROADCASTS: dict[str, dict[str, Any]] = {}
+MOVIE_CHANNEL_LINKS: list[str] = []
+PENDING_CHANNEL_ADD_ADMINS: set[int] = set()
 USER_REGISTER_LOCK = asyncio.Lock()
 CATALOG_WRITE_LOCK = asyncio.Lock()
 STAT_RECONCILE_LOCK = asyncio.Lock()
@@ -418,6 +421,80 @@ async def set_force_join_enabled(enabled: bool) -> None:
             )
         except Exception as exc:
             logger.warning("Could not persist Force Join setting (%s)", type(exc).__name__)
+
+
+def valid_movie_channel_link(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and parsed.netloc.lower() in {
+        "t.me", "www.t.me", "telegram.me", "www.telegram.me"
+    }
+
+
+async def load_movie_channel_links() -> None:
+    """Restore the admin-managed channel links from Firebase."""
+    MOVIE_CHANNEL_LINKS.clear()
+    if not firebase_ready():
+        return
+    try:
+        value = await asyncio.to_thread(firebase_reference("settings/movie_channel_links").get)
+        if isinstance(value, list):
+            MOVIE_CHANNEL_LINKS.extend(
+                link.strip() for link in value
+                if isinstance(link, str) and valid_movie_channel_link(link)
+            )
+    except Exception as exc:
+        logger.warning("Could not load movie channel links (%s)", type(exc).__name__)
+
+
+async def save_movie_channel_links() -> None:
+    if firebase_ready():
+        try:
+            await asyncio.to_thread(
+                firebase_reference("settings/movie_channel_links").set,
+                list(MOVIE_CHANNEL_LINKS),
+            )
+        except Exception as exc:
+            logger.warning("Could not save movie channel links (%s)", type(exc).__name__)
+
+
+def movie_channel_manager_keyboard() -> InlineKeyboardMarkup:
+    rows = [[keyboard_button("➕ Add channel", callback_data="moviechannel_add", style="success")]]
+    for index, link in enumerate(MOVIE_CHANNEL_LINKS):
+        rows.append([keyboard_button(f"Remove channel {index + 1}", callback_data=f"moviechannel_remove:{index}", style="danger")])
+    return InlineKeyboardMarkup(rows)
+
+
+def movie_channel_manager_text() -> str:
+    if MOVIE_CHANNEL_LINKS:
+        channels = "\n".join(
+            f"{index + 1}. {html.escape(link)}"
+            for index, link in enumerate(MOVIE_CHANNEL_LINKS)
+        )
+    else:
+        channels = "No movie channels added yet."
+    return (
+        "<b>MOVIE CHANNELS</b>\n\n"
+        f"{channels}\n\n"
+        "These links will be sent as a separate <b>JOIN AND ENJOY</b> message after every file delivery."
+    )
+
+
+async def send_join_and_enjoy_message(bot, chat_id: int) -> None:
+    if not MOVIE_CHANNEL_LINKS:
+        return
+    keyboard = InlineKeyboardMarkup([
+        [keyboard_button(f"Join Channel {index + 1}", url=link, style="success")]
+        for index, link in enumerate(MOVIE_CHANNEL_LINKS)
+    ])
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="<b>JOIN AND ENJOY</b>\n\nJoin our movie channels for more updates and files.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except TelegramError as exc:
+        logger.warning("Could not send Join and Enjoy message (%s)", type(exc).__name__)
 
 
 async def send_force_join_prompt(message) -> None:
@@ -1030,6 +1107,7 @@ async def deliver_group_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
             reply_markup=delivered_file_keyboard(),
         )
         await record_file_received()
+        await send_join_and_enjoy_message(context.bot, user.id)
     except TelegramError as exc:
         logger.info("Telegram could not deliver one group-selected file (%s)", type(exc).__name__)
         await message.reply_text("<b>DELIVERY UNAVAILABLE</b>\n\nTelegram could not copy this item from the archive.", parse_mode="HTML")
@@ -1433,6 +1511,7 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=delivered_file_keyboard(),
             )
             await record_file_received()
+            await send_join_and_enjoy_message(context.bot, query.from_user.id)
         except TelegramError as exc:
             logger.warning("Telegram could not copy one indexed source message (%s)", type(exc).__name__)
             await context.bot.send_message(
@@ -1773,6 +1852,57 @@ async def force_join_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
 
+async def add_new_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE, argument: str = "") -> None:
+    """Show the admin menu for links sent after each delivered file."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await message.reply_text("Admin only.")
+        return
+    argument = argument.strip()
+    if argument:
+        if not valid_movie_channel_link(argument):
+            await message.reply_text("Send a valid Telegram channel link, for example https://t.me/yourchannel")
+            return
+        if argument not in MOVIE_CHANNEL_LINKS:
+            MOVIE_CHANNEL_LINKS.append(argument)
+            await save_movie_channel_links()
+        await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
+        return
+    PENDING_CHANNEL_ADD_ADMINS.discard(user.id)
+    await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
+
+
+async def movie_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message or not query.from_user:
+        return
+    if not ADMIN_ID or query.from_user.id != ADMIN_ID:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    data = query.data or ""
+    if data == "moviechannel_add":
+        PENDING_CHANNEL_ADD_ADMINS.add(query.from_user.id)
+        await query.answer()
+        await query.message.reply_text(
+            "Send the Telegram channel link now.\nExample: <code>https://t.me/yourchannel</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        index = int(data.split(":", 1)[1])
+        link = MOVIE_CHANNEL_LINKS.pop(index)
+    except (IndexError, ValueError):
+        await query.answer("This channel option is no longer available.", show_alert=True)
+        return
+    await save_movie_channel_links()
+    PENDING_CHANNEL_ADD_ADMINS.discard(query.from_user.id)
+    await query.answer("Channel removed.")
+    await query.edit_message_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
+
+
 async def notify_admin(text: str) -> None:
     if not BOT_APP or not ADMIN_ID:
         return
@@ -2090,6 +2220,8 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await send_broadcast(update, context, data.split(":", 1)[1], cancel=False)
         elif data.startswith("broadcast_cancel:"):
             await send_broadcast(update, context, data.split(":", 1)[1], cancel=True)
+        elif data == "moviechannel_add" or data.startswith("moviechannel_remove:"):
+            await movie_channel_callback(update, context)
         else:
             await update.callback_query.answer("This button is no longer available.", show_alert=True)
         return
@@ -2100,6 +2232,16 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     content = message.text or message.caption or ""
     if not content:
+        return
+    if ADMIN_ID and user.id == ADMIN_ID and user.id in PENDING_CHANNEL_ADD_ADMINS:
+        if valid_movie_channel_link(content.strip()):
+            if content.strip() not in MOVIE_CHANNEL_LINKS:
+                MOVIE_CHANNEL_LINKS.append(content.strip())
+                await save_movie_channel_links()
+            PENDING_CHANNEL_ADD_ADMINS.discard(user.id)
+            await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
+        else:
+            await message.reply_text("Please send a valid Telegram channel link, for example https://t.me/yourchannel")
         return
     command, _, argument = content.partition(" ")
     command = command.split("@", 1)[0].lower()
@@ -2120,6 +2262,8 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await prepare_broadcast(update, context, argument)
     elif command == "/forcejoin":
         await force_join_command(update, context, argument)
+    elif command == "/addnewchannel":
+        await add_new_channel_command(update, context, argument)
     elif command.startswith("/"):
         return
     else:
@@ -2237,6 +2381,7 @@ async def configure_bot(application: Application) -> None:
             BotCommand("requests", "Admin: review movie requests"),
             BotCommand("broadcast", "Admin: prepare a confirmed broadcast"),
             BotCommand("forcejoin", "Admin: toggle Force Join"),
+            BotCommand("addnewchannel", "Admin: manage movie channel links"),
         ]
     )
     if RENDER_EXTERNAL_URL:
@@ -2256,6 +2401,7 @@ async def lifespan(application: FastAPI):
     global BOT_APP, FIREBASE_APP
     FIREBASE_APP = initialize_firebase()
     await load_force_join_setting()
+    await load_movie_channel_links()
     if BOT_TOKEN:
         BOT_APP = Application.builder().token(BOT_TOKEN).updater(None).build()
         BOT_APP.add_handler(TypeHandler(Update, dispatch_update))
