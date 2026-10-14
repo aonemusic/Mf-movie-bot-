@@ -172,7 +172,10 @@ class SearchAndMediaTests(unittest.TestCase):
 
         async def run():
             try:
-                main.MOVIE_CHANNEL_LINKS[:] = ["https://t.me/mf_movies", "https://t.me/mf_updates"]
+                main.MOVIE_CHANNEL_LINKS[:] = [
+                    {"url": "https://t.me/mf_movies", "name": "MF Movies"},
+                    {"url": "https://t.me/mf_updates", "name": "MF Updates"},
+                ]
                 await main.send_join_and_enjoy_message(bot, 77)
             finally:
                 main.MOVIE_CHANNEL_LINKS[:] = old_links
@@ -181,10 +184,10 @@ class SearchAndMediaTests(unittest.TestCase):
         bot.send_message.assert_awaited_once()
         kwargs = bot.send_message.await_args.kwargs
         self.assertEqual(kwargs["chat_id"], 77)
-        self.assertIn("JOIN AND ENJOY", kwargs["text"])
+        self.assertNotIn("JOIN AND ENJOY", kwargs["text"])
         self.assertEqual(
-            [button.url for row in kwargs["reply_markup"].inline_keyboard for button in row],
-            ["https://t.me/mf_movies", "https://t.me/mf_updates"],
+            [(button.text, button.url) for row in kwargs["reply_markup"].inline_keyboard for button in row],
+            [("MF Movies", "https://t.me/mf_movies"), ("MF Updates", "https://t.me/mf_updates")],
         )
 
     def test_nonmembers_are_blocked_from_every_catalog_and_delivery_path(self):

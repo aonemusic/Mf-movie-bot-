@@ -118,8 +118,8 @@ ACTIVE_FILE_MESSAGES: set[tuple[int, int]] = set()
 CONSUMED_FILE_MESSAGES: dict[tuple[int, int], float] = {}
 MOVIE_REQUEST_SESSIONS: dict[str, dict[str, Any]] = {}
 PENDING_BROADCASTS: dict[str, dict[str, Any]] = {}
-MOVIE_CHANNEL_LINKS: list[str] = []
-PENDING_CHANNEL_ADD_ADMINS: set[int] = set()
+MOVIE_CHANNEL_LINKS: list[dict[str, str]] = []
+PENDING_CHANNEL_ADD_ADMINS: dict[int, dict[str, str]] = {}
 USER_REGISTER_LOCK = asyncio.Lock()
 CATALOG_WRITE_LOCK = asyncio.Lock()
 STAT_RECONCILE_LOCK = asyncio.Lock()
@@ -438,10 +438,14 @@ async def load_movie_channel_links() -> None:
     try:
         value = await asyncio.to_thread(firebase_reference("settings/movie_channel_links").get)
         if isinstance(value, list):
-            MOVIE_CHANNEL_LINKS.extend(
-                link.strip() for link in value
-                if isinstance(link, str) and valid_movie_channel_link(link)
-            )
+            for index, item in enumerate(value, 1):
+                if isinstance(item, str) and valid_movie_channel_link(item):
+                    MOVIE_CHANNEL_LINKS.append({"url": item.strip(), "name": f"Channel {index}"})
+                elif isinstance(item, dict):
+                    link = str(item.get("url", "")).strip()
+                    name = str(item.get("name", "")).strip()
+                    if valid_movie_channel_link(link) and name:
+                        MOVIE_CHANNEL_LINKS.append({"url": link, "name": name[:64]})
     except Exception as exc:
         logger.warning("Could not load movie channel links (%s)", type(exc).__name__)
 
@@ -459,23 +463,23 @@ async def save_movie_channel_links() -> None:
 
 def movie_channel_manager_keyboard() -> InlineKeyboardMarkup:
     rows = [[keyboard_button("➕ Add channel", callback_data="moviechannel_add", style="success")]]
-    for index, link in enumerate(MOVIE_CHANNEL_LINKS):
-        rows.append([keyboard_button(f"Remove channel {index + 1}", callback_data=f"moviechannel_remove:{index}", style="danger")])
+    for index, channel in enumerate(MOVIE_CHANNEL_LINKS):
+        rows.append([keyboard_button(f"Remove {channel['name']}", callback_data=f"moviechannel_remove:{index}", style="danger")])
     return InlineKeyboardMarkup(rows)
 
 
 def movie_channel_manager_text() -> str:
     if MOVIE_CHANNEL_LINKS:
         channels = "\n".join(
-            f"{index + 1}. {html.escape(link)}"
-            for index, link in enumerate(MOVIE_CHANNEL_LINKS)
+            f"{index + 1}. {html.escape(channel['name'])} — {html.escape(channel['url'])}"
+            for index, channel in enumerate(MOVIE_CHANNEL_LINKS)
         )
     else:
         channels = "No movie channels added yet."
     return (
         "<b>MOVIE CHANNELS</b>\n\n"
         f"{channels}\n\n"
-        "These links will be sent as a separate <b>JOIN AND ENJOY</b> message after every file delivery."
+        "Each saved channel will be sent as a separate button after every file delivery."
     )
 
 
@@ -483,13 +487,13 @@ async def send_join_and_enjoy_message(bot, chat_id: int) -> None:
     if not MOVIE_CHANNEL_LINKS:
         return
     keyboard = InlineKeyboardMarkup([
-        [keyboard_button(f"Join Channel {index + 1}", url=link, style="success")]
-        for index, link in enumerate(MOVIE_CHANNEL_LINKS)
+        [keyboard_button(channel["name"], url=channel["url"], style="success")]
+        for channel in MOVIE_CHANNEL_LINKS
     ])
     try:
         await bot.send_message(
             chat_id=chat_id,
-            text="<b>JOIN AND ENJOY</b>\n\nJoin our movie channels for more updates and files.",
+            text="<b>More updates and files</b>",
             parse_mode="HTML",
             reply_markup=keyboard,
         )
@@ -1866,12 +1870,10 @@ async def add_new_channel_command(update: Update, context: ContextTypes.DEFAULT_
         if not valid_movie_channel_link(argument):
             await message.reply_text("Send a valid Telegram channel link, for example https://t.me/yourchannel")
             return
-        if argument not in MOVIE_CHANNEL_LINKS:
-            MOVIE_CHANNEL_LINKS.append(argument)
-            await save_movie_channel_links()
-        await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
+        PENDING_CHANNEL_ADD_ADMINS[user.id] = {"url": argument}
+        await message.reply_text("Now send the button name for this channel.")
         return
-    PENDING_CHANNEL_ADD_ADMINS.discard(user.id)
+    PENDING_CHANNEL_ADD_ADMINS.pop(user.id, None)
     await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
 
 
@@ -1884,10 +1886,10 @@ async def movie_channel_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
     data = query.data or ""
     if data == "moviechannel_add":
-        PENDING_CHANNEL_ADD_ADMINS.add(query.from_user.id)
+        PENDING_CHANNEL_ADD_ADMINS[query.from_user.id] = {}
         await query.answer()
         await query.message.reply_text(
-            "Send the Telegram channel link now.\nExample: <code>https://t.me/yourchannel</code>",
+            "Send the Telegram channel link first.\nExample: <code>https://t.me/yourchannel</code>",
             parse_mode="HTML",
         )
         return
@@ -1898,7 +1900,7 @@ async def movie_channel_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("This channel option is no longer available.", show_alert=True)
         return
     await save_movie_channel_links()
-    PENDING_CHANNEL_ADD_ADMINS.discard(query.from_user.id)
+    PENDING_CHANNEL_ADD_ADMINS.pop(query.from_user.id, None)
     await query.answer("Channel removed.")
     await query.edit_message_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
 
@@ -2234,14 +2236,23 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not content:
         return
     if ADMIN_ID and user.id == ADMIN_ID and user.id in PENDING_CHANNEL_ADD_ADMINS:
-        if valid_movie_channel_link(content.strip()):
-            if content.strip() not in MOVIE_CHANNEL_LINKS:
-                MOVIE_CHANNEL_LINKS.append(content.strip())
-                await save_movie_channel_links()
-            PENDING_CHANNEL_ADD_ADMINS.discard(user.id)
-            await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
+        pending = PENDING_CHANNEL_ADD_ADMINS[user.id]
+        if not pending.get("url"):
+            if valid_movie_channel_link(content.strip()):
+                pending["url"] = content.strip()
+                await message.reply_text("Now send the button name for this channel.")
+            else:
+                await message.reply_text("Please send a valid Telegram channel link, for example https://t.me/yourchannel")
         else:
-            await message.reply_text("Please send a valid Telegram channel link, for example https://t.me/yourchannel")
+            name = content.strip()
+            if not name or len(name) > 64:
+                await message.reply_text("Please send a button name between 1 and 64 characters.")
+                return
+            if not any(channel["url"] == pending["url"] for channel in MOVIE_CHANNEL_LINKS):
+                MOVIE_CHANNEL_LINKS.append({"url": pending["url"], "name": name})
+                await save_movie_channel_links()
+            PENDING_CHANNEL_ADD_ADMINS.pop(user.id, None)
+            await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
         return
     command, _, argument = content.partition(" ")
     command = command.split("@", 1)[0].lower()
