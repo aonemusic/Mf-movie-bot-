@@ -150,6 +150,35 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_cancel_clears_pending_channel_updates_without_saving(self):
+        old_admin = main.ADMIN_ID
+        old_force = set(main.PENDING_FORCE_JOIN_EDITS)
+        old_channels = dict(main.PENDING_CHANNEL_ADD_ADMINS)
+        message = SimpleNamespace(reply_text=AsyncMock())
+
+        async def run():
+            try:
+                main.ADMIN_ID = 42
+                main.PENDING_FORCE_JOIN_EDITS.clear()
+                main.PENDING_FORCE_JOIN_EDITS.add(42)
+                main.PENDING_CHANNEL_ADD_ADMINS.clear()
+                main.PENDING_CHANNEL_ADD_ADMINS[42] = {"url": "https://t.me/example"}
+                await main.cancel_pending_command(
+                    SimpleNamespace(effective_message=message, effective_user=SimpleNamespace(id=42)),
+                    SimpleNamespace(),
+                )
+            finally:
+                main.ADMIN_ID = old_admin
+                main.PENDING_FORCE_JOIN_EDITS.clear()
+                main.PENDING_FORCE_JOIN_EDITS.update(old_force)
+                main.PENDING_CHANNEL_ADD_ADMINS.clear()
+                main.PENDING_CHANNEL_ADD_ADMINS.update(old_channels)
+
+        asyncio.run(run())
+        self.assertFalse(main.PENDING_FORCE_JOIN_EDITS)
+        self.assertFalse(main.PENDING_CHANNEL_ADD_ADMINS)
+        self.assertIn("No changes were saved", message.reply_text.await_args.args[0])
+
     def test_force_join_command_is_admin_only_and_toggles_state(self):
         old_admin = main.ADMIN_ID
         old_enabled = main.FORCE_JOIN_ENABLED

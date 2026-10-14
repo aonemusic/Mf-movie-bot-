@@ -59,6 +59,7 @@ Create the Realtime Database before deploying. In Firebase Console, open **Proje
 - `/broadcast Your message` — admin only; text-only broadcasts (up to 3,200 characters) are ready now: the bot previews the message and requires a confirmation button before sending. Image/media broadcasts are optional and are not required.
 - `/forcejoin on|off|status` — admin only; activate or deactivate the required-channel membership check. The choice is saved in Firebase and restored after a restart. It is active by default.
 - `/forcesubedit` — admin only; change the Force Join channel by sending its channel ID and username together, for example `-1001234567890 @mychannel`. The new channel is saved in Firebase and used by all membership checks and Join buttons.
+- `/cancel` — admin only; cancel a pending `/forcesubedit` or `/addnewchannel` update before anything is saved.
 - `/addnewchannel` — admin only; manage the Telegram channel buttons shown in a separate message after each delivered file. Use **Add channel**, send the channel link, then send the custom button name; use **Remove** to delete one.
 - `/healthz` — public, secret-free readiness check for Render. Returns HTTP 200 only when the bot, Firebase, at least one source channel, and required Force Join configuration are ready; returns HTTP 503 otherwise.
 

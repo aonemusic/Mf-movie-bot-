@@ -1956,6 +1956,28 @@ async def force_sub_edit_command(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
+async def cancel_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel any pending admin channel-edit flow without changing saved settings."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await message.reply_text("Admin only.")
+        return
+    cancelled: list[str] = []
+    if user.id in PENDING_FORCE_JOIN_EDITS:
+        PENDING_FORCE_JOIN_EDITS.discard(user.id)
+        cancelled.append("Force Join channel update")
+    if user.id in PENDING_CHANNEL_ADD_ADMINS:
+        PENDING_CHANNEL_ADD_ADMINS.pop(user.id, None)
+        cancelled.append("movie channel update")
+    if cancelled:
+        await message.reply_text(f"Cancelled: {', '.join(cancelled)}. No changes were saved.")
+    else:
+        await message.reply_text("There is no pending update to cancel.")
+
+
 async def add_new_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE, argument: str = "") -> None:
     """Show the admin menu for links sent after each delivered file."""
     message = update.effective_message
@@ -2335,6 +2357,11 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     content = message.text or message.caption or ""
     if not content:
         return
+    command, _, argument = content.partition(" ")
+    command = command.split("@", 1)[0].lower()
+    if command == "/cancel":
+        await cancel_pending_command(update, context)
+        return
     if ADMIN_ID and user.id == ADMIN_ID and user.id in PENDING_FORCE_JOIN_EDITS:
         parsed = parse_force_join_channel_input(content)
         if not parsed:
@@ -2374,8 +2401,6 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             PENDING_CHANNEL_ADD_ADMINS.pop(user.id, None)
             await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
         return
-    command, _, argument = content.partition(" ")
-    command = command.split("@", 1)[0].lower()
     if command in {"/start", "/help"}:
         await start_command(update, context, argument if command == "/start" else "")
     elif command == "/latest":
@@ -2515,6 +2540,7 @@ async def configure_bot(application: Application) -> None:
             BotCommand("broadcast", "Admin: prepare a confirmed broadcast"),
             BotCommand("forcejoin", "Admin: toggle Force Join"),
             BotCommand("forcesubedit", "Admin: edit Force Join channel"),
+            BotCommand("cancel", "Admin: cancel a pending update"),
             BotCommand("addnewchannel", "Admin: manage movie channel links"),
         ]
     )
