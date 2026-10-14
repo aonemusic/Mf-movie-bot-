@@ -133,6 +133,23 @@ class SearchAndMediaTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_force_join_channel_edit_updates_id_username_url(self):
+        self.assertEqual(main.parse_force_join_channel_input("-1001234567890 @newchannel"), ("-1001234567890", "@newchannel"))
+        self.assertIsNone(main.parse_force_join_channel_input("@newchannel"))
+        old_values = (main.FORCE_JOIN_CHANNEL_ID, main.FORCE_JOIN_CHANNEL_USERNAME, main.FORCE_JOIN_CHANNEL_URL)
+
+        async def run():
+            try:
+                with patch.object(main, "firebase_ready", return_value=False):
+                    await main.save_force_join_channel("-1001234567890", "@newchannel")
+                self.assertEqual(main.FORCE_JOIN_CHANNEL_ID, "-1001234567890")
+                self.assertEqual(main.FORCE_JOIN_CHANNEL_USERNAME, "@newchannel")
+                self.assertEqual(main.FORCE_JOIN_CHANNEL_URL, "https://t.me/newchannel")
+            finally:
+                main.FORCE_JOIN_CHANNEL_ID, main.FORCE_JOIN_CHANNEL_USERNAME, main.FORCE_JOIN_CHANNEL_URL = old_values
+
+        asyncio.run(run())
+
     def test_force_join_command_is_admin_only_and_toggles_state(self):
         old_admin = main.ADMIN_ID
         old_enabled = main.FORCE_JOIN_ENABLED

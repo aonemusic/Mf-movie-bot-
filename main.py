@@ -87,6 +87,7 @@ MAIN_CHANNEL_HANDLE = "@mfmainchannel"
 MAIN_CHANNEL_ID = os.getenv("MAIN_CHANNEL_ID", "").strip() or os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip()
 FORCE_JOIN_CHANNEL_ID = os.getenv("FORCE_JOIN_CHANNEL_ID", "").strip() or MAIN_CHANNEL_ID
 FORCE_JOIN_CHANNEL_URL = os.getenv("FORCE_JOIN_CHANNEL_URL", "").strip() or MAIN_CHANNEL_URL
+FORCE_JOIN_CHANNEL_USERNAME = os.getenv("FORCE_JOIN_CHANNEL_USERNAME", "").strip() or MAIN_CHANNEL_HANDLE
 FORCE_JOIN_ENABLED = os.getenv("FORCE_JOIN_ENABLED", "true").strip().lower() not in {"0", "false", "off", "no"}
 ADMIN_CONTACT_URL = "https://t.me/mf_admin_contact_bot"
 DELIVERY_BOT_HANDLE = "@mf_movie_bot"
@@ -120,6 +121,7 @@ MOVIE_REQUEST_SESSIONS: dict[str, dict[str, Any]] = {}
 PENDING_BROADCASTS: dict[str, dict[str, Any]] = {}
 MOVIE_CHANNEL_LINKS: list[dict[str, str]] = []
 PENDING_CHANNEL_ADD_ADMINS: dict[int, dict[str, str]] = {}
+PENDING_FORCE_JOIN_EDITS: set[int] = set()
 USER_REGISTER_LOCK = asyncio.Lock()
 CATALOG_WRITE_LOCK = asyncio.Lock()
 STAT_RECONCILE_LOCK = asyncio.Lock()
@@ -372,7 +374,7 @@ def delivered_file_keyboard() -> InlineKeyboardMarkup:
 
 def force_join_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[keyboard_button("Join @mfmainchannel", url=FORCE_JOIN_CHANNEL_URL, style="danger")]]
+        [[keyboard_button(f"Join {force_join_channel_label()}", url=FORCE_JOIN_CHANNEL_URL, style="danger")]]
     )
 
 
@@ -421,6 +423,64 @@ async def set_force_join_enabled(enabled: bool) -> None:
             )
         except Exception as exc:
             logger.warning("Could not persist Force Join setting (%s)", type(exc).__name__)
+
+
+def normalize_force_join_username(value: str) -> str | None:
+    username = value.strip()
+    if username.startswith("https://t.me/"):
+        username = username.removeprefix("https://t.me/").split("/", 1)[0]
+    username = username.lstrip("@").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        return None
+    return f"@{username}"
+
+
+def force_join_channel_label() -> str:
+    return FORCE_JOIN_CHANNEL_USERNAME or "the required channel"
+
+
+async def load_force_join_channel() -> None:
+    """Restore the admin-managed Force Join channel from Firebase."""
+    global FORCE_JOIN_CHANNEL_ID, FORCE_JOIN_CHANNEL_URL, FORCE_JOIN_CHANNEL_USERNAME
+    if not firebase_ready():
+        return
+    try:
+        value = await asyncio.to_thread(firebase_reference("settings/force_join_channel").get)
+        if not isinstance(value, dict):
+            return
+        channel_id = str(value.get("id", "")).strip()
+        username = normalize_force_join_username(str(value.get("username", "")))
+        if channel_id and username:
+            FORCE_JOIN_CHANNEL_ID = channel_id
+            FORCE_JOIN_CHANNEL_USERNAME = username
+            FORCE_JOIN_CHANNEL_URL = f"https://t.me/{username.lstrip('@')}"
+    except Exception as exc:
+        logger.warning("Could not load Force Join channel (%s)", type(exc).__name__)
+
+
+async def save_force_join_channel(channel_id: str, username: str) -> None:
+    global FORCE_JOIN_CHANNEL_ID, FORCE_JOIN_CHANNEL_URL, FORCE_JOIN_CHANNEL_USERNAME
+    normalized_username = normalize_force_join_username(username)
+    if not channel_id.strip() or not normalized_username:
+        raise ValueError("Invalid Force Join channel ID or username")
+    FORCE_JOIN_CHANNEL_ID = channel_id.strip()
+    FORCE_JOIN_CHANNEL_USERNAME = normalized_username
+    FORCE_JOIN_CHANNEL_URL = f"https://t.me/{normalized_username.lstrip('@')}"
+    if firebase_ready():
+        await asyncio.to_thread(
+            firebase_reference("settings/force_join_channel").set,
+            {"id": FORCE_JOIN_CHANNEL_ID, "username": FORCE_JOIN_CHANNEL_USERNAME},
+        )
+
+
+def parse_force_join_channel_input(value: str) -> tuple[str, str] | None:
+    parts = value.strip().split()
+    if len(parts) != 2:
+        return None
+    username = normalize_force_join_username(parts[1])
+    if not username:
+        return None
+    return parts[0], username
 
 
 def valid_movie_channel_link(value: str) -> bool:
@@ -506,7 +566,7 @@ async def send_force_join_prompt(message) -> None:
         return
     await message.reply_text(
         "<b>MEMBERSHIP REQUIRED</b>\n\n"
-        "Join @mfmainchannel to unlock movie search, the latest additions, and file delivery.\n\n"
+        f"Join {force_join_channel_label()} to unlock movie search, the latest additions, and file delivery.\n\n"
         "After joining, send your movie title again or tap your selected file button once more.\n\n"
         f'<a href="{ADMIN_CONTACT_URL}">Contact the admin</a> if you need help.',
         parse_mode="HTML",
@@ -1063,7 +1123,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, payl
     await message.reply_text(
         "<b>MF MOVIE LIBRARY</b>\n"
         "<i>Your archive, beautifully within reach.</i>\n\n"
-        f'<a href="{FORCE_JOIN_CHANNEL_URL}">Join @mfmainchannel</a> to unlock the library · '
+        f'<a href="{FORCE_JOIN_CHANNEL_URL}">Join {force_join_channel_label()}</a> to unlock the library · '
         f'<a href="{INSTAGRAM_URL}">Instagram</a> · '
         f'<a href="{ADMIN_CONTACT_URL}">Contact admin</a>.\n\n'
         "<b>Search</b>\n"
@@ -1455,7 +1515,7 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Open a private chat with MF Movie Library to receive files.", show_alert=True)
         return
     if not await is_user_member(context.bot, query.from_user.id):
-        await query.answer("Join @mfmainchannel to unlock file delivery.", show_alert=True)
+        await query.answer(f"Join {force_join_channel_label()} to unlock file delivery.", show_alert=True)
         await send_force_join_prompt(query.message)
         return
     await register_user(query.from_user)
@@ -1619,7 +1679,7 @@ async def movie_request_callback(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML",
         )
     elif status == "membership":
-        await query.answer("Join @mfmainchannel to submit a movie request.", show_alert=True)
+        await query.answer(f"Join {force_join_channel_label()} to submit a movie request.", show_alert=True)
         await send_force_join_prompt(query.message)
     else:
         await query.answer(
@@ -1793,7 +1853,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "<b>MF MOVIE LIBRARY · LIVE STATUS</b>\n\n"
             "Realtime Database: <b>Not ready</b>\n"
             f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
-            f'Channel membership: <b>Required</b> · <a href="{FORCE_JOIN_CHANNEL_URL}">@mfmainchannel</a>',
+            f'Channel membership: <b>Required</b> · <a href="{FORCE_JOIN_CHANNEL_URL}">{html.escape(force_join_channel_label())}</a>',
             parse_mode="HTML",
         )
         return
@@ -1819,7 +1879,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Total file received: <b>{stats['total_file_received']:,}</b>\n"
         f"Total searches: <b>{stats['total_searches']:,}</b>\n"
         f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
-        f'Channel membership: <b>Required</b> · <a href="{FORCE_JOIN_CHANNEL_URL}">@mfmainchannel</a>\n'
+        f'Channel membership: <b>Required</b> · <a href="{FORCE_JOIN_CHANNEL_URL}">{html.escape(force_join_channel_label())}</a>\n'
         f"Automatic file deletion: <b>{DELETE_AFTER_SECONDS // 60} minutes</b>\n\n"
         f"<b>TOP SEARCHES</b>\n{top_text}",
         parse_mode="HTML",
@@ -1854,6 +1914,46 @@ async def force_join_command(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "Use <code>/forcejoin on</code>, <code>/forcejoin off</code>, or <code>/forcejoin status</code>.",
             parse_mode="HTML",
         )
+
+
+async def force_sub_edit_command(update: Update, context: ContextTypes.DEFAULT_TYPE, argument: str = "") -> None:
+    """Allow the admin to change the Force Join channel ID and username."""
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await message.reply_text("Admin only.")
+        return
+    value = argument.strip()
+    if not value:
+        PENDING_FORCE_JOIN_EDITS.add(user.id)
+        await message.reply_text(
+            f"Current Force Join channel: <code>{html.escape(FORCE_JOIN_CHANNEL_ID or 'not set')}</code> "
+            f"{html.escape(force_join_channel_label())}\n\n"
+            "Send the new channel ID and username in one message.\n"
+            "Example: <code>-1001234567890 @mychannel</code>",
+            parse_mode="HTML",
+        )
+        return
+    parsed = parse_force_join_channel_input(value)
+    if not parsed:
+        await message.reply_text(
+            "Invalid format. Send: <code>channel_id @username</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        await save_force_join_channel(*parsed)
+    except Exception as exc:
+        logger.warning("Could not update Force Join channel (%s)", type(exc).__name__)
+        await message.reply_text("Could not save the Force Join channel. Please try again.")
+        return
+    PENDING_FORCE_JOIN_EDITS.discard(user.id)
+    await message.reply_text(
+        f"Force Join channel updated to <b>{html.escape(force_join_channel_label())}</b>.",
+        parse_mode="HTML",
+    )
 
 
 async def add_new_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE, argument: str = "") -> None:
@@ -2235,6 +2335,26 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     content = message.text or message.caption or ""
     if not content:
         return
+    if ADMIN_ID and user.id == ADMIN_ID and user.id in PENDING_FORCE_JOIN_EDITS:
+        parsed = parse_force_join_channel_input(content)
+        if not parsed:
+            await message.reply_text(
+                "Please send both values in this format: <code>channel_id @username</code>",
+                parse_mode="HTML",
+            )
+            return
+        try:
+            await save_force_join_channel(*parsed)
+        except Exception as exc:
+            logger.warning("Could not update Force Join channel (%s)", type(exc).__name__)
+            await message.reply_text("Could not save the Force Join channel. Please try again.")
+            return
+        PENDING_FORCE_JOIN_EDITS.discard(user.id)
+        await message.reply_text(
+            f"Force Join channel updated to <b>{html.escape(force_join_channel_label())}</b>.",
+            parse_mode="HTML",
+        )
+        return
     if ADMIN_ID and user.id == ADMIN_ID and user.id in PENDING_CHANNEL_ADD_ADMINS:
         pending = PENDING_CHANNEL_ADD_ADMINS[user.id]
         if not pending.get("url"):
@@ -2273,6 +2393,8 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await prepare_broadcast(update, context, argument)
     elif command == "/forcejoin":
         await force_join_command(update, context, argument)
+    elif command == "/forcesubedit":
+        await force_sub_edit_command(update, context, argument)
     elif command == "/addnewchannel":
         await add_new_channel_command(update, context, argument)
     elif command.startswith("/"):
@@ -2290,7 +2412,7 @@ async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("Search results are not available in this chat.", show_alert=True)
         return
     if not await is_user_member(context.bot, query.from_user.id):
-        await query.answer("Join @mfmainchannel to unlock the catalog.", show_alert=True)
+        await query.answer(f"Join {force_join_channel_label()} to unlock the catalog.", show_alert=True)
         await send_force_join_prompt(query.message)
         return
     if is_private:
@@ -2392,6 +2514,7 @@ async def configure_bot(application: Application) -> None:
             BotCommand("requests", "Admin: review movie requests"),
             BotCommand("broadcast", "Admin: prepare a confirmed broadcast"),
             BotCommand("forcejoin", "Admin: toggle Force Join"),
+            BotCommand("forcesubedit", "Admin: edit Force Join channel"),
             BotCommand("addnewchannel", "Admin: manage movie channel links"),
         ]
     )
@@ -2412,6 +2535,7 @@ async def lifespan(application: FastAPI):
     global BOT_APP, FIREBASE_APP
     FIREBASE_APP = initialize_firebase()
     await load_force_join_setting()
+    await load_force_join_channel()
     await load_movie_channel_links()
     if BOT_TOKEN:
         BOT_APP = Application.builder().token(BOT_TOKEN).updater(None).build()
