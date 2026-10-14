@@ -471,7 +471,11 @@ def delivered_file_caption(record: dict[str, Any], bot=None) -> tuple[str, list[
     if not isinstance(source_caption, str) or not source_caption.strip():
         source_caption = str(record.get("file_name") or "Movie file")
     instagram_prefix = f"Main channel: {MAIN_CHANNEL_HANDLE}\nBot: {DELIVERY_BOT_HANDLE}\n"
-    footer = f"{instagram_prefix}Instagram\nAuto-deletes in 10 minutes."
+    footer = (
+        f'{instagram_prefix}Instagram\n'
+        'Use "VLC MEDIA PLAYER" app to avoid issues while opening files!\n'
+        "Auto-deletes in 10 minutes."
+    )
     separator = "\n\n"
     source_budget = 1024 - _utf16_units(separator + footer)
     truncated = _utf16_units(source_caption) > source_budget
@@ -564,6 +568,14 @@ async def increment_stat(path: str, amount: int = 1) -> int:
 
     value = await asyncio.to_thread(firebase_reference(path).transaction, increment)
     return int(value or 0)
+
+
+async def record_file_received() -> None:
+    """Count one file successfully delivered by the bot."""
+    try:
+        await increment_stat("stats/total_file_received")
+    except Exception as exc:
+        logger.warning("Could not record one received file (%s)", type(exc).__name__)
 
 
 async def ensure_total_files_count() -> int:
@@ -715,6 +727,10 @@ async def get_status_stats() -> dict[str, Any]:
             "total_files": len(catalog),
             "total_searches": sum(search_count(record) for record in top),
         }
+        try:
+            totals["total_file_received"] = max(0, int(stats.get("total_file_received", 0) or 0))
+        except (TypeError, ValueError):
+            totals["total_file_received"] = 0
         for name, value in totals.items():
             await asyncio.to_thread(firebase_reference(f"stats/{name}").set, value)
     return {
@@ -1013,6 +1029,7 @@ async def deliver_group_file(update: Update, context: ContextTypes.DEFAULT_TYPE,
             caption_entities=caption_entities,
             reply_markup=delivered_file_keyboard(),
         )
+        await record_file_received()
     except TelegramError as exc:
         logger.info("Telegram could not deliver one group-selected file (%s)", type(exc).__name__)
         await message.reply_text("<b>DELIVERY UNAVAILABLE</b>\n\nTelegram could not copy this item from the archive.", parse_mode="HTML")
@@ -1415,6 +1432,7 @@ async def file_button_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 caption_entities=caption_entities,
                 reply_markup=delivered_file_keyboard(),
             )
+            await record_file_received()
         except TelegramError as exc:
             logger.warning("Telegram could not copy one indexed source message (%s)", type(exc).__name__)
             await context.bot.send_message(
@@ -1715,6 +1733,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "<b>Realtime Database</b> · Connected\n"
         f"Users: <b>{stats['total_users']:,}</b>\n"
         f"Total files: <b>{stats['total_files']:,}</b>\n"
+        f"Total file received: <b>{stats['total_file_received']:,}</b>\n"
         f"Total searches: <b>{stats['total_searches']:,}</b>\n"
         f"Source channels: <b>{len(SOURCE_CHANNEL_IDS)} connected</b>\n"
         f'Channel membership: <b>Required</b> · <a href="{FORCE_JOIN_CHANNEL_URL}">@mfmainchannel</a>\n'

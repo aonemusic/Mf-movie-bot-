@@ -705,6 +705,7 @@ class SearchAndMediaTests(unittest.TestCase):
         )
         self.assertIn("Main channel: @mfmainchannel", copy_args["caption"])
         self.assertIn("Bot: @mf_movie_bot", copy_args["caption"])
+        self.assertIn('Use "VLC MEDIA PLAYER" app to avoid issues while opening files!', copy_args["caption"])
         self.assertIn("Auto-deletes in 10 minutes.", copy_args["caption"])
         bot.send_message.assert_not_awaited()
 
@@ -819,6 +820,7 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertTrue(copy_args["caption"].startswith("Original caption\n\n"))
         self.assertIn("Main channel: @mfmainchannel", copy_args["caption"])
         self.assertIn("Bot: @mf_movie_bot", copy_args["caption"])
+        self.assertIn('Use "VLC MEDIA PLAYER" app to avoid issues while opening files!', copy_args["caption"])
         self.assertIn("Auto-deletes in 10 minutes.", copy_args["caption"])
         self.assertEqual(copy_args["reply_markup"].inline_keyboard[0][0].style, "danger")
         self.assertEqual(copy_args["reply_markup"].inline_keyboard[0][1].style, "success")
@@ -845,6 +847,16 @@ class SearchAndMediaTests(unittest.TestCase):
             top = next(value.value for key, value in refs.items() if key.startswith(path))
             self.assertEqual(top["count"], 2)
             self.assertEqual(top["query"], "the matrix 1999")
+
+    def test_file_received_counter_is_incremented(self):
+        reference = FakeReference(4)
+
+        async def run():
+            with patch.object(main, "firebase_reference", return_value=reference):
+                await main.record_file_received()
+
+        asyncio.run(run())
+        self.assertEqual(reference.value, 5)
 
     def test_active_user_tracking_deduplicates_group_users_without_private_registration(self):
         refs = {}
@@ -893,6 +905,7 @@ class SearchAndMediaTests(unittest.TestCase):
                 "total_users": 0,
                 "total_files": 0,
                 "total_searches": 0,
+                "total_file_received": 12,
                 "top_searches": {
                     "one": {"query": "Alpha", "count": 4},
                     "two": {"query": "Beta", "count": 2},
@@ -913,10 +926,12 @@ class SearchAndMediaTests(unittest.TestCase):
         stats = asyncio.run(run())
         self.assertEqual(stats["total_users"], 3)
         self.assertEqual(stats["total_files"], 3)
+        self.assertEqual(stats["total_file_received"], 12)
         self.assertEqual(stats["top_searches"][0]["query"], "The Matrix")
         self.assertEqual(stats["total_searches"], 11)
         self.assertEqual(tree["stats"]["total_users"], 3)
         self.assertEqual(tree["stats"]["total_files"], 3)
+        self.assertEqual(tree["stats"]["total_file_received"], 12)
         self.assertEqual(tree["stats"]["total_searches"], 11)
 
     def test_health_endpoint_reports_unready_as_503_and_ready_as_200_payload(self):
