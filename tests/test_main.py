@@ -71,6 +71,42 @@ class SearchAndMediaTests(unittest.TestCase):
         self.assertEqual(main.normalize_search_text("The.Matrix_1999.MKV"), "the matrix 1999 mkv")
         self.assertEqual(main.normalize_search_text("Cafe\u0301 2025"), "cafe\u0301 2025")
 
+    def test_rate_limiter_blocks_burst_and_allows_after_window(self):
+        old_values = (main.RATE_LIMIT_MAX_MESSAGES, main.RATE_LIMIT_WINDOW_SECONDS, dict(main.USER_UPDATE_TIMES))
+
+        async def run():
+            try:
+                main.RATE_LIMIT_MAX_MESSAGES = 2
+                main.RATE_LIMIT_WINDOW_SECONDS = 10
+                main.USER_UPDATE_TIMES.clear()
+                self.assertTrue(await main.allow_user_update(7001))
+                self.assertTrue(await main.allow_user_update(7001))
+                self.assertFalse(await main.allow_user_update(7001))
+                self.assertTrue(await main.allow_user_update(main.ADMIN_ID or 7002))
+            finally:
+                main.RATE_LIMIT_MAX_MESSAGES, main.RATE_LIMIT_WINDOW_SECONDS, previous = old_values
+                main.USER_UPDATE_TIMES.clear()
+                main.USER_UPDATE_TIMES.update(previous)
+
+        asyncio.run(run())
+
+    def test_telegram_startup_operation_retries_transient_errors(self):
+        attempts = 0
+
+        async def operation():
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise main.TelegramError("temporary outage")
+            return "ready"
+
+        async def run():
+            with patch.object(main.asyncio, "sleep", new=AsyncMock()):
+                return await main.retry_telegram_operation(operation, "test operation")
+
+        self.assertEqual(asyncio.run(run()), "ready")
+        self.assertEqual(attempts, 3)
+
     def test_media_details_preserve_filename_and_size(self):
         message = SimpleNamespace(
             document=SimpleNamespace(file_name="Movie.Name.mkv", file_size=987654321),

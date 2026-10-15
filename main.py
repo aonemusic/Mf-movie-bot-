@@ -11,6 +11,7 @@ import os
 import re
 import time
 import unicodedata
+from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -106,6 +107,18 @@ MAX_SEARCH_RESULTS = 10
 REQUESTS_PER_PAGE = 20
 CACHE_SECONDS = 20
 BROADCAST_DELAY_SECONDS = 0.05
+try:
+    RATE_LIMIT_MAX_MESSAGES = max(1, int(os.getenv("RATE_LIMIT_MAX_MESSAGES", "12")))
+except ValueError:
+    RATE_LIMIT_MAX_MESSAGES = 12
+try:
+    RATE_LIMIT_WINDOW_SECONDS = max(1, float(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "10")))
+except ValueError:
+    RATE_LIMIT_WINDOW_SECONDS = 10.0
+try:
+    MAX_CONCURRENT_UPDATES = max(1, int(os.getenv("MAX_CONCURRENT_UPDATES", "20")))
+except ValueError:
+    MAX_CONCURRENT_UPDATES = 20
 
 BOT_APP: Application | None = None
 FIREBASE_APP: firebase_admin.App | None = None
@@ -126,6 +139,9 @@ USER_REGISTER_LOCK = asyncio.Lock()
 CATALOG_WRITE_LOCK = asyncio.Lock()
 STAT_RECONCILE_LOCK = asyncio.Lock()
 BROADCAST_TASKS: dict[str, asyncio.Task] = {}
+USER_UPDATE_TIMES: dict[int, deque[float]] = defaultdict(deque)
+USER_RATE_LIMIT_LOCK = asyncio.Lock()
+UPDATE_CONCURRENCY_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_UPDATES)
 
 
 def chat_reference(value: str | int) -> int | str:
@@ -134,6 +150,39 @@ def chat_reference(value: str | int) -> int | str:
         return int(text)
     except ValueError:
         return text
+
+
+async def allow_user_update(user_id: int) -> bool:
+    """Allow a bounded burst per user without throttling the configured admin."""
+    if ADMIN_ID and user_id == ADMIN_ID:
+        return True
+    now = time.monotonic()
+    async with USER_RATE_LIMIT_LOCK:
+        bucket = USER_UPDATE_TIMES[user_id]
+        while bucket and now - bucket[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= RATE_LIMIT_MAX_MESSAGES:
+            return False
+        bucket.append(now)
+        if len(USER_UPDATE_TIMES) > 10000:
+            stale_ids = [key for key, values in USER_UPDATE_TIMES.items() if not values]
+            for key in stale_ids[:1000]:
+                USER_UPDATE_TIMES.pop(key, None)
+        return True
+
+
+async def retry_telegram_operation(operation, label: str, attempts: int = 3):
+    """Retry transient Telegram API startup calls with bounded exponential backoff."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except (TelegramError, asyncio.TimeoutError) as exc:
+            if attempt == attempts:
+                logger.error("%s failed after %d attempts (%s)", label, attempts, type(exc).__name__)
+                raise
+            delay = min(2 ** (attempt - 1), 8)
+            logger.warning("%s failed (%s); retrying in %ss", label, type(exc).__name__, delay)
+            await asyncio.sleep(delay)
 
 
 def normalize_search_text(value: str) -> str:
@@ -2324,7 +2373,7 @@ async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, tok
             logger.error("Broadcast %s is stored and will resume after service restart", token)
 
 
-async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def process_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.channel_post:
         await index_channel_post(update)
         return
@@ -2426,6 +2475,27 @@ async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     else:
         await search_command(update, context, content)
+
+
+async def dispatch_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Protect update handling from bursts and cap simultaneous work."""
+    user = update.effective_user
+    if user and not await allow_user_update(int(user.id)):
+        try:
+            if update.callback_query:
+                await update.callback_query.answer("Too many requests. Please wait a few seconds.", show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text("Too many requests. Please wait a few seconds.")
+        except TelegramError as exc:
+            logger.debug("Could not send rate-limit notice (%s)", type(exc).__name__)
+        return
+    async with UPDATE_CONCURRENCY_SEMAPHORE:
+        try:
+            await process_update(update, context)
+        except TelegramError as exc:
+            logger.error("Telegram API error while processing update (%s)", type(exc).__name__)
+        except Exception:
+            logger.exception("Unexpected error while processing update")
 
 
 async def search_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2556,6 +2626,15 @@ async def configure_bot(application: Application) -> None:
         logger.warning("Telegram webhook not registered; RENDER_EXTERNAL_URL is unavailable")
 
 
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Central last-resort handler for errors raised by Telegram update processing."""
+    error = getattr(context, "error", None)
+    if isinstance(error, TelegramError):
+        logger.error("Telegram update error (%s)", type(error).__name__)
+    else:
+        logger.exception("Unhandled Telegram update error", exc_info=error)
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global BOT_APP, FIREBASE_APP
@@ -2566,10 +2645,17 @@ async def lifespan(application: FastAPI):
     if BOT_TOKEN:
         BOT_APP = Application.builder().token(BOT_TOKEN).updater(None).build()
         BOT_APP.add_handler(TypeHandler(Update, dispatch_update))
+        BOT_APP.add_error_handler(telegram_error_handler)
         await BOT_APP.initialize()
         await BOT_APP.start()
-        await resolve_source_channels(BOT_APP)
-        await configure_bot(BOT_APP)
+        await retry_telegram_operation(
+            lambda: resolve_source_channels(BOT_APP),
+            "Resolve source channels",
+        )
+        await retry_telegram_operation(
+            lambda: configure_bot(BOT_APP),
+            "Configure Telegram bot",
+        )
         await restore_pending_deletions()
         await resume_broadcast_jobs()
     else:
