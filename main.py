@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import re
+import uuid
 import time
 import unicodedata
 from collections import defaultdict, deque
@@ -135,6 +136,9 @@ PENDING_BROADCASTS: dict[str, dict[str, Any]] = {}
 MOVIE_CHANNEL_LINKS: list[dict[str, str]] = []
 PENDING_CHANNEL_ADD_ADMINS: dict[int, dict[str, str]] = {}
 PENDING_FORCE_JOIN_EDITS: set[int] = set()
+PENDING_FORWARD_CHANNEL_ADMINS: set[int] = set()
+FORWARD_TASKS: dict[str, asyncio.Task] = {}
+FORWARD_WORKER_ID = uuid.uuid4().hex
 USER_REGISTER_LOCK = asyncio.Lock()
 CATALOG_WRITE_LOCK = asyncio.Lock()
 STAT_RECONCILE_LOCK = asyncio.Lock()
@@ -570,6 +574,101 @@ async def save_movie_channel_links() -> None:
             logger.warning("Could not save movie channel links (%s)", type(exc).__name__)
 
 
+def parse_forward_channel_reference(value: str) -> int | str | None:
+    text = value.strip()
+    if re.fullmatch(r"-100\d+", text):
+        return int(text)
+    if re.fullmatch(r"@[A-Za-z0-9_]{5,32}", text):
+        return text
+    match = re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]{5,32})/?", text)
+    return f"@{match.group(1)}" if match else None
+
+
+async def get_forward_destinations() -> list[dict[str, Any]]:
+    if not firebase_ready():
+        return []
+    raw = await asyncio.to_thread(firebase_reference("settings/forward_channels").get)
+    if not isinstance(raw, dict):
+        return []
+    channels = []
+    for key, item in raw.items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            channel_id = int(item.get("id", key))
+        except (TypeError, ValueError):
+            continue
+        channels.append({
+            "id": channel_id,
+            "title": str(item.get("title") or item.get("username") or channel_id)[:64],
+            "username": str(item.get("username") or ""),
+        })
+    return sorted(channels, key=lambda channel: channel["title"].casefold())
+
+
+async def register_forward_destination(bot, user_id: int, value: str) -> tuple[bool, str, int | None]:
+    if not firebase_ready():
+        return False, "Firebase is not connected; the channel was not saved.", None
+    channel_ref = parse_forward_channel_reference(value)
+    if channel_ref is None:
+        return False, "Send a channel ID such as <code>-1001234567890</code> or a public @username.", None
+    try:
+        chat = await bot.get_chat(chat_id=channel_ref)
+        if str(getattr(chat, "type", "")) != "channel":
+            return False, "That chat is not a Telegram channel.", None
+        bot_id = getattr(bot, "id", None)
+        if not bot_id:
+            bot_id = (await bot.get_me()).id
+        bot_member = await bot.get_chat_member(chat_id=chat.id, user_id=int(bot_id))
+        admin_member = await bot.get_chat_member(chat_id=chat.id, user_id=int(user_id))
+    except TelegramError as exc:
+        logger.warning("Could not verify a forwarding channel (%s)", type(exc).__name__)
+        return False, "Could not verify that channel. Add this bot as an administrator with permission to post, then try again.", None
+
+    bot_status = str(getattr(getattr(bot_member, "status", ""), "value", getattr(bot_member, "status", "")))
+    admin_status = str(getattr(getattr(admin_member, "status", ""), "value", getattr(admin_member, "status", "")))
+    if bot_status not in {"creator", "administrator"} or not bool(getattr(bot_member, "can_post_messages", False)):
+        return False, "This bot must be a channel administrator with permission to post there.", None
+    if admin_status not in {"creator", "administrator"}:
+        return False, "Your configured admin account must also be a channel administrator.", None
+
+    record = {
+        "id": int(chat.id),
+        "title": str(getattr(chat, "title", "") or getattr(chat, "username", "") or chat.id)[:128],
+        "username": str(getattr(chat, "username", "") or ""),
+        "added_by": int(user_id),
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        await asyncio.to_thread(
+            firebase_reference(f"settings/forward_channels/{int(chat.id)}").set,
+            record,
+        )
+    except Exception as exc:
+        logger.error("Could not save a forwarding channel in Firebase (%s)", type(exc).__name__)
+        return False, "Could not save the channel in Firebase. Please try again.", None
+    return True, f"Saved <b>{html.escape(record['title'])}</b> ({int(chat.id)}).", int(chat.id)
+
+
+async def forward_source_selection_keyboard(bot, destination_id: int) -> InlineKeyboardMarkup | None:
+    rows = []
+    for source_id in sorted(SOURCE_CHANNEL_IDS):
+        title = str(source_id)
+        try:
+            source_chat = await bot.get_chat(chat_id=source_id)
+            title = str(getattr(source_chat, "title", "") or getattr(source_chat, "username", "") or source_id)
+        except TelegramError as exc:
+            logger.info("Could not resolve a source title for forwarding (%s)", type(exc).__name__)
+        rows.append([
+            keyboard_button(
+                f"Forward {title[:20]} + new",
+                callback_data=f"forward_route:{source_id}:{destination_id}",
+                style="success",
+            )
+        ])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 def movie_channel_manager_keyboard() -> InlineKeyboardMarkup:
     rows = [[keyboard_button("➕ Add channel", callback_data="moviechannel_add", style="success")]]
     for index, channel in enumerate(MOVIE_CHANNEL_LINKS):
@@ -758,6 +857,200 @@ async def get_catalog_entry(key: str) -> dict[str, Any] | None:
         return FILE_CATALOG_CACHE[key]
     data = await asyncio.to_thread(firebase_reference(f"files/{key}").get)
     return data if isinstance(data, dict) else None
+
+
+def forwarding_route_key(source_chat_id: int, destination_chat_id: int) -> str:
+    return f"{int(source_chat_id)}_{int(destination_chat_id)}"
+
+
+async def forward_catalog_record(bot, record: dict[str, Any], destination_id: int, route_key: str) -> str:
+    try:
+        source_id = int(record["source_chat_id"])
+        message_id = int(record["source_message_id"])
+    except (KeyError, TypeError, ValueError):
+        return "failed"
+
+    marker = firebase_reference(
+        f"settings/forward_routes/{route_key}/forwarded/{message_id}"
+    )
+    owner = uuid.uuid4().hex
+    now = time.time()
+
+    def claim(current):
+        if isinstance(current, dict) and current.get("status") == "sent":
+            return current
+        if isinstance(current, dict) and current.get("status") == "sending":
+            if current.get("worker_id") == FORWARD_WORKER_ID and now - float(current.get("updated_at", now)) < 300:
+                return current
+        return {"status": "sending", "owner": owner, "worker_id": FORWARD_WORKER_ID, "updated_at": now}
+
+    claimed = await asyncio.to_thread(marker.transaction, claim)
+    if not isinstance(claimed, dict) or claimed.get("owner") != owner:
+        return "already"
+
+    try:
+        for attempt in range(3):
+            try:
+                await bot.forward_message(
+                    chat_id=int(destination_id),
+                    from_chat_id=source_id,
+                    message_id=message_id,
+                )
+                break
+            except RetryAfter as exc:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(retry_delay(exc) + 1)
+        await asyncio.to_thread(
+            marker.set,
+            {"status": "sent", "updated_at": time.time()},
+        )
+        return "sent"
+    except TelegramError as exc:
+        logger.warning("Telegram could not forward one catalogue post (%s)", type(exc).__name__)
+        await asyncio.to_thread(
+            marker.set,
+            {"status": "failed", "error": type(exc).__name__, "updated_at": time.time()},
+        )
+        return "failed"
+    except Exception as exc:
+        logger.warning("Forwarding one catalogue post failed (%s)", type(exc).__name__)
+        await asyncio.to_thread(
+            marker.set,
+            {"status": "failed", "error": type(exc).__name__, "updated_at": time.time()},
+        )
+        return "failed"
+
+
+async def run_forward_backfill(route_key: str) -> None:
+    if not BOT_APP or not firebase_ready():
+        return
+    job_ref = firebase_reference(f"forward_jobs/{route_key}")
+    try:
+        job = await asyncio.to_thread(job_ref.get)
+        if not isinstance(job, dict) or job.get("status") != "running":
+            return
+        source_id = int(job["source_chat_id"])
+        destination_id = int(job["destination_chat_id"])
+        catalog = await get_catalog(refresh=True)
+        records = [
+            (key, value)
+            for key, value in catalog.items()
+            if isinstance(value, dict)
+            and int(value.get("source_chat_id", 0) or 0) == source_id
+        ]
+        records.sort(key=lambda item: (int(item[1].get("source_message_id", 0) or 0), item[0]))
+        total = len(records)
+        sent = failed = processed = 0
+        for _, record in records:
+            result = await forward_catalog_record(BOT_APP.bot, record, destination_id, route_key)
+            sent += result == "sent"
+            failed += result == "failed"
+            processed += 1
+            if processed % 25 == 0:
+                await asyncio.to_thread(
+                    job_ref.update,
+                    {"processed": processed, "sent_count": sent, "failed_count": failed},
+                )
+            await asyncio.sleep(0.05)
+        finished_at = datetime.now(timezone.utc).isoformat()
+        status = "partial" if failed else "completed"
+        await asyncio.to_thread(
+            job_ref.update,
+            {
+                "status": status,
+                "total": total,
+                "processed": processed,
+                "sent_count": sent,
+                "failed_count": failed,
+                "finished_at": finished_at,
+            },
+        )
+        await notify_admin(
+            "<b>CHANNEL BACKFILL " + ("COMPLETE" if not failed else "PARTIAL") + "</b>\n\n"
+            f"Existing indexed files: <b>{total:,}</b>\n"
+            f"Forwarded now: <b>{sent:,}</b>\n"
+            f"Could not forward: <b>{failed:,}</b>\n\n"
+            "Auto-forwarding for new files is enabled for this source and destination."
+        )
+    except Exception as exc:
+        logger.error("Firebase channel backfill failed (%s)", type(exc).__name__)
+        try:
+            await asyncio.to_thread(
+                job_ref.update,
+                {"status": "failed", "error": type(exc).__name__},
+            )
+        except Exception:
+            pass
+        await notify_admin("Channel backfill stopped because the catalogue could not be read. You can try again.")
+    finally:
+        FORWARD_TASKS.pop(route_key, None)
+
+
+def start_forward_backfill(route_key: str, application: Application | None = None) -> bool:
+    target = application or BOT_APP
+    if not target:
+        return False
+    current = FORWARD_TASKS.get(route_key)
+    if current and not current.done():
+        return True
+    try:
+        FORWARD_TASKS[route_key] = target.create_task(run_forward_backfill(route_key))
+        return True
+    except Exception as exc:
+        logger.error("Could not schedule channel backfill (%s)", type(exc).__name__)
+        return False
+
+
+async def resume_forward_backfills() -> None:
+    if not firebase_ready() or not BOT_APP:
+        return
+    try:
+        jobs = await asyncio.to_thread(firebase_reference("forward_jobs").get)
+    except Exception as exc:
+        logger.warning("Could not restore channel backfills (%s)", type(exc).__name__)
+        return
+    if isinstance(jobs, dict):
+        for route_key, job in jobs.items():
+            if isinstance(job, dict) and job.get("status") == "running":
+                try:
+                    await asyncio.to_thread(
+                        firebase_reference(f"settings/forward_routes/{route_key}").set,
+                        {
+                            "source_chat_id": int(job["source_chat_id"]),
+                            "destination_chat_id": int(job["destination_chat_id"]),
+                            "enabled": True,
+                            "created_at": job.get("created_at", datetime.now(timezone.utc).isoformat()),
+                            "added_by": int(job.get("admin_id", ADMIN_ID)),
+                        },
+                    )
+                except Exception as exc:
+                    logger.warning("Could not restore an active forwarding route (%s)", type(exc).__name__)
+                    continue
+                start_forward_backfill(str(route_key), BOT_APP)
+
+
+async def auto_forward_new_media(record: dict[str, Any]) -> None:
+    if not BOT_APP or not firebase_ready():
+        return
+    try:
+        source_id = int(record["source_chat_id"])
+        routes = await asyncio.to_thread(firebase_reference("settings/forward_routes").get)
+        if not isinstance(routes, dict):
+            return
+        for route_key, route in routes.items():
+            if not isinstance(route, dict) or not route.get("enabled"):
+                continue
+            if int(route.get("source_chat_id", 0) or 0) != source_id:
+                continue
+            await forward_catalog_record(
+                BOT_APP.bot,
+                record,
+                int(route["destination_chat_id"]),
+                str(route_key),
+            )
+    except Exception as exc:
+        logger.warning("Automatic forwarding of one new file failed (%s)", type(exc).__name__)
 
 
 async def increment_stat(path: str, amount: int = 1) -> int:
@@ -1421,7 +1714,11 @@ async def index_channel_post(update: Update) -> None:
     except Exception as exc:
         logger.error("Firebase write failed for one source post (%s)", type(exc).__name__)
         return
-    if not (is_new and BOT_APP and BOT_USERNAME):
+    if not is_new:
+        return
+    if BOT_APP:
+        await auto_forward_new_media(record)
+    if not (BOT_APP and BOT_USERNAME):
         return
     key = f"{message.chat.id}_{message.message_id}"
     for destination in movie_announcement_destinations():
@@ -2032,6 +2329,9 @@ async def cancel_pending_command(update: Update, context: ContextTypes.DEFAULT_T
     if user.id in PENDING_CHANNEL_ADD_ADMINS:
         PENDING_CHANNEL_ADD_ADMINS.pop(user.id, None)
         cancelled.append("movie channel update")
+    if user.id in PENDING_FORWARD_CHANNEL_ADMINS:
+        PENDING_FORWARD_CHANNEL_ADMINS.discard(user.id)
+        cancelled.append("forward destination update")
     if cancelled:
         await message.reply_text(f"Cancelled: {', '.join(cancelled)}. No changes were saved.")
     else:
@@ -2057,6 +2357,132 @@ async def add_new_channel_command(update: Update, context: ContextTypes.DEFAULT_
         return
     PENDING_CHANNEL_ADD_ADMINS.pop(user.id, None)
     await message.reply_text(movie_channel_manager_text(), parse_mode="HTML", reply_markup=movie_channel_manager_keyboard())
+
+
+async def add_forward_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE, argument: str = "") -> None:
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not ADMIN_ID or user.id != ADMIN_ID:
+        await message.reply_text("Admin only.")
+        return
+    if message.chat.type != "private":
+        await message.reply_text("Run <code>/addchannel</code> in the private bot chat.", parse_mode="HTML")
+        return
+    if user.id in PENDING_FORCE_JOIN_EDITS or user.id in PENDING_CHANNEL_ADD_ADMINS:
+        await message.reply_text("Finish the current channel update or use <code>/cancel</code> first.", parse_mode="HTML")
+        return
+    if argument.strip():
+        await complete_forward_channel_add(message, context, user.id, argument.strip())
+        return
+    PENDING_FORWARD_CHANNEL_ADMINS.add(user.id)
+    await message.reply_text(
+        "Send the destination channel ID (for example <code>-1001234567890</code>) or a public @username.\n"
+        "You and this bot must be channel administrators; the bot must have permission to post.\n\n"
+        "Use <code>/cancel</code> to stop.",
+        parse_mode="HTML",
+    )
+
+
+async def complete_forward_channel_add(message, context: ContextTypes.DEFAULT_TYPE, user_id: int, value: str) -> None:
+    ok, response, destination_id = await register_forward_destination(context.bot, user_id, value)
+    if not ok or destination_id is None:
+        await message.reply_text(response, parse_mode="HTML")
+        return
+    keyboard = await forward_source_selection_keyboard(context.bot, destination_id)
+    if not keyboard:
+        await message.reply_text(
+            response + "\n\nNo source channels are configured yet; there is nothing to backfill or auto-forward.",
+            parse_mode="HTML",
+        )
+        return
+    await message.reply_text(
+        response + "\n\nChoose a source channel. The button will forward all matching files already indexed in Firebase "
+        "and enable automatic forwarding of new files from that source to this destination.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def forward_route_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not query.message or not query.from_user:
+        return
+    if not ADMIN_ID or query.from_user.id != ADMIN_ID:
+        await query.answer("Admin only.", show_alert=True)
+        return
+    if query.message.chat.type != "private":
+        await query.answer("Open this action in the private bot chat.", show_alert=True)
+        return
+    try:
+        _, raw_source_id, raw_destination_id = (query.data or "").split(":", 2)
+        source_id = int(raw_source_id)
+        destination_id = int(raw_destination_id)
+    except (TypeError, ValueError):
+        await query.answer("This forwarding option is invalid.", show_alert=True)
+        return
+    if source_id not in SOURCE_CHANNEL_IDS:
+        await query.answer("That source channel is not configured.", show_alert=True)
+        return
+    try:
+        destinations = await get_forward_destinations()
+    except Exception as exc:
+        logger.warning("Could not load forwarding destinations (%s)", type(exc).__name__)
+        await query.answer("Could not load the destination list.", show_alert=True)
+        return
+    if not any(int(channel["id"]) == destination_id for channel in destinations):
+        await query.answer("That destination is no longer registered.", show_alert=True)
+        return
+    route_key = forwarding_route_key(source_id, destination_id)
+    try:
+        job_ref = firebase_reference(f"forward_jobs/{route_key}")
+        existing_job = await asyncio.to_thread(job_ref.get)
+        if isinstance(existing_job, dict) and existing_job.get("status") == "running":
+            await query.answer("The backfill is already running.", show_alert=True)
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        await asyncio.to_thread(
+            job_ref.set,
+            {
+                "source_chat_id": source_id,
+                "destination_chat_id": destination_id,
+                "admin_id": int(query.from_user.id),
+                "status": "running",
+                "created_at": now,
+                "processed": 0,
+                "sent_count": 0,
+                "failed_count": 0,
+            },
+        )
+        await asyncio.to_thread(
+            firebase_reference(f"settings/forward_routes/{route_key}").set,
+            {
+                "source_chat_id": source_id,
+                "destination_chat_id": destination_id,
+                "enabled": True,
+                "created_at": now,
+                "added_by": int(query.from_user.id),
+            },
+        )
+    except Exception as exc:
+        logger.error("Could not save the forwarding route (%s)", type(exc).__name__)
+        try:
+            await asyncio.to_thread(job_ref.update, {"status": "failed", "error": type(exc).__name__})
+        except Exception:
+            pass
+        await query.answer("Could not save this forwarding route in Firebase.", show_alert=True)
+        return
+    await query.answer("Backfill started; new files will also forward automatically.")
+    await query.edit_message_text(
+        "<b>FORWARDING ENABLED</b>\n\n"
+        f"Source chat ID: <code>{source_id}</code>\n"
+        f"Destination chat ID: <code>{destination_id}</code>\n\n"
+        "Firebase-indexed files are being forwarded in the background. New files from this source will forward automatically.",
+        parse_mode="HTML",
+    )
+    if not start_forward_backfill(route_key, context.application):
+        logger.error("Forwarding backfill %s is stored and will resume after service restart", route_key)
 
 
 async def movie_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2392,6 +2818,8 @@ async def process_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         data = update.callback_query.data or ""
         if data.startswith("file:"):
             await file_button_callback(update, context)
+        elif data.startswith("forward_route:"):
+            await forward_route_callback(update, context)
         elif data.startswith("page:"):
             await search_page_callback(update, context)
         elif data.startswith("movie_request:"):
@@ -2421,6 +2849,13 @@ async def process_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     command = command.split("@", 1)[0].lower()
     if command == "/cancel":
         await cancel_pending_command(update, context)
+        return
+    if command == "/addchannel":
+        await add_forward_channel_command(update, context, argument)
+        return
+    if ADMIN_ID and user.id == ADMIN_ID and user.id in PENDING_FORWARD_CHANNEL_ADMINS:
+        PENDING_FORWARD_CHANNEL_ADMINS.discard(user.id)
+        await complete_forward_channel_add(message, context, user.id, content)
         return
     if ADMIN_ID and user.id == ADMIN_ID and user.id in PENDING_FORCE_JOIN_EDITS:
         parsed = parse_force_join_channel_input(content)
@@ -2623,6 +3058,7 @@ async def configure_bot(application: Application) -> None:
             BotCommand("forcesubedit", "Admin: edit Force Join channel"),
             BotCommand("cancel", "Admin: cancel a pending update"),
             BotCommand("addnewchannel", "Admin: manage movie channel links"),
+            BotCommand("addchannel", "Admin: backfill and auto-forward channel files"),
         ]
     )
     if RENDER_EXTERNAL_URL:
@@ -2669,6 +3105,7 @@ async def lifespan(application: FastAPI):
         )
         await restore_pending_deletions()
         await resume_broadcast_jobs()
+        await resume_forward_backfills()
     else:
         logger.warning("BOT_TOKEN is missing; bot commands and channel indexing are disabled")
     yield

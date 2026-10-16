@@ -1245,9 +1245,10 @@ class SearchAndMediaTests(unittest.TestCase):
                 main.ADMIN_ID = old_admin
         asyncio.run(run())
 
-    def test_forwarding_code_and_command_are_removed(self):
+    def test_forwarding_is_scoped_to_the_addchannel_workflow(self):
         source = Path(main.__file__).read_text(encoding="utf-8").lower()
-        self.assertNotIn("forward_message", source)
+        self.assertIn("forward_message", source)
+        self.assertIn('command == "/addchannel"', source)
         self.assertNotIn("/shareall", source)
         self.assertNotIn("approved_destination", source)
 
