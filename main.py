@@ -655,10 +655,21 @@ def _truncate_utf16(value: str, max_units: int) -> str:
     return "".join(output)
 
 
+def sanitize_caption_usernames(value: str) -> tuple[str, bool]:
+    """Remove Telegram-style @usernames so delivered captions cannot open source users."""
+    sanitized = re.sub(r"(?<![A-Za-z0-9_])@[A-Za-z0-9_]{5,32}", "", value)
+    sanitized = "\n".join(line.rstrip() for line in sanitized.splitlines())
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
+    return sanitized, sanitized != value
+
+
 def delivered_file_caption(record: dict[str, Any], bot=None) -> tuple[str, list[MessageEntity] | None]:
-    """Combine the original source caption and the delivery footer on the file itself."""
+    """Combine a sanitized source caption and the delivery footer on the file itself."""
     source_caption = record.get("caption")
     if not isinstance(source_caption, str) or not source_caption.strip():
+        source_caption = str(record.get("file_name") or "Movie file")
+    source_caption, caption_was_sanitized = sanitize_caption_usernames(source_caption)
+    if not source_caption:
         source_caption = str(record.get("file_name") or "Movie file")
     instagram_prefix = f"Main channel: {MAIN_CHANNEL_HANDLE}\nBot: {DELIVERY_BOT_HANDLE}\n"
     footer = (
@@ -680,7 +691,7 @@ def delivered_file_caption(record: dict[str, Any], bot=None) -> tuple[str, list[
     )
     if truncated:
         return caption, [instagram_entity]
-    raw_entities = record.get("caption_entities")
+    raw_entities = record.get("caption_entities") if not caption_was_sanitized else None
     entities = [
         MessageEntity.de_json(entity, bot)
         for entity in raw_entities

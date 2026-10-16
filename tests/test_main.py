@@ -368,6 +368,19 @@ class SearchAndMediaTests(unittest.TestCase):
             main._utf16_units(caption[: caption.index("Instagram")]),
         )
 
+    def test_delivered_file_caption_removes_source_usernames_and_clickable_entities(self):
+        caption, entities = main.delivered_file_caption(
+            {
+                "file_name": "Movie.mkv",
+                "caption": "Movie title\nJoin @source_channel for more",
+                "caption_entities": [{"type": "mention", "offset": 23, "length": 15}],
+            }
+        )
+        self.assertNotIn("@source_channel", caption)
+        self.assertIn("Movie title", caption)
+        self.assertEqual([entity.type for entity in entities], ["text_link"])
+        self.assertEqual(entities[0].url, main.INSTAGRAM_URL)
+
     def test_delivered_file_caption_preserves_footer_when_source_caption_is_too_long(self):
         caption, entities = main.delivered_file_caption(
             {"caption": "🎬" * 1000, "file_name": "Movie.mkv", "caption_entities": []}
